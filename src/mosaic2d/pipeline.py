@@ -105,6 +105,32 @@ def image_sharpness(img_u8: np.ndarray) -> float:
     return float(cv2.Laplacian(g, cv2.CV_32F).var())
 
 
+def _overlap_log_ratio(a: np.ndarray, b: np.ndarray, H: np.ndarray):
+    """log(sharpness of a / sharpness of b) on their common area (H: a -> b)."""
+    def energy(img, mask):
+        g = cv2.GaussianBlur(img.astype(np.float32), (0, 0), 1.0)
+        lap = cv2.Laplacian(g, cv2.CV_32F)
+        m = cv2.erode(mask, np.ones((9, 9), np.uint8)) > 0
+        return float((lap[m] ** 2).mean()) if m.sum() > 2000 else None
+
+    s = 0.5
+    S = np.diag([s, s, 1.0])
+    a2 = cv2.resize(a, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    b2 = cv2.resize(b, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    Hs = S @ H @ np.linalg.inv(S)
+    ones_a = np.full(a2.shape, 255, np.uint8)
+    ones_b = np.full(b2.shape, 255, np.uint8)
+    a_in_b = cv2.warpPerspective(a2, Hs, b2.shape[::-1])
+    m_b = cv2.warpPerspective(ones_a, Hs, b2.shape[::-1], flags=cv2.INTER_NEAREST)
+    b_in_a = cv2.warpPerspective(b2, np.linalg.inv(Hs), a2.shape[::-1])
+    m_a = cv2.warpPerspective(ones_b, np.linalg.inv(Hs), a2.shape[::-1], flags=cv2.INTER_NEAREST)
+    e = [energy(a_in_b, m_b), energy(b2, m_b), energy(a2, m_a), energy(b_in_a, m_a)]
+    if any(v is None or v <= 0 for v in e):
+        return None
+    # (warped a vs native b) and (native a vs warped b): interpolation bias cancels
+    return 0.5 * (np.log(e[0] / e[1]) + np.log(e[2] / e[3]))
+
+
 def seam_penalty(quality: float) -> float:
     """Seam score multiplier: blurred frames (quality < 1) lose overlaps to sharper ones."""
     return float(np.clip(1.0 / max(quality, 1e-3) ** 2, 0.5, 25.0))
@@ -269,18 +295,51 @@ class Project:
         self.frames = frames
         if self.prof.multilens:
             self._lens_consensus()
-        self._image_quality()
         self.timing["ingest_s"] = time.time() - t
 
     def _image_quality(self):
-        """Relative sharpness per frame (comparable to Metashape's image quality)."""
-        med = float(np.median([f.sharpness for f in self.frames])) or 1.0
-        for f in self.frames:
-            f.quality = f.sharpness / med
+        """
+        Relative sharpness per frame, estimated from overlaps so that scene
+        content (smooth rock vs. textured sand) does not count as blur.
+
+        For every accepted pair the two working images are compared on their
+        common area only, in both directions (each image warped onto the other,
+        so interpolation blur affects both sides equally). The log ratios are
+        then solved for one value per frame by least squares (median = 1).
+        Frames without accepted pairs keep the plain per-image measure.
+        """
+        idx = {f.index: k for k, f in enumerate(self.frames)}
+        rows, rhs = [], []
+        for (i, j), r in self.pairs.items():
+            if not r.ok or r.H is None or r.method == "phasecorr":
+                continue
+            a, b = self.frames[i].reg, self.frames[j].reg
+            if a is None or b is None:
+                continue
+            ra = _overlap_log_ratio(a, b, r.H)
+            if ra is None:
+                continue
+            rows.append((idx[i], idx[j]))
+            rhs.append(ra)
+        n = len(self.frames)
+        x = np.log(np.array([max(f.sharpness, 1e-9) for f in self.frames]))
+        x -= np.median(x)
+        if rows:
+            A = np.zeros((len(rows) + 1, n))
+            for k, (i, j) in enumerate(rows):
+                A[k, i], A[k, j] = 1.0, -1.0
+            A[-1, :] = 1e-3                      # gauge: tiny pull to zero mean
+            sol, *_ = np.linalg.lstsq(A, np.r_[rhs, 0.0], rcond=None)
+            connected = np.zeros(n, bool)
+            for i, j in rows:
+                connected[i] = connected[j] = True
+            x = np.where(connected, sol - np.median(sol[connected]), x)
+        for f, v in zip(self.frames, x):
+            f.quality = float(np.exp(v))
         low = [f.path.name for f in self.frames if f.quality < 0.5]
         if low:
-            self.log(f"  {len(low)} blurred frame(s) (quality < 0.5 of median): {', '.join(low)} "
-                     "-- used only where no sharper frame overlaps")
+            self.log(f"  {len(low)} blurred frame(s) (sharpness < 0.5 x median, from overlaps): "
+                     f"{', '.join(low)} -- used only where no sharper frame overlaps")
 
     def _lens_consensus(self):
         res = [f.lens for f in self.frames]
@@ -787,7 +846,9 @@ def run(inputs, out_dir, settings: Settings | None = None, name="mosaic", render
     proj = Project(inputs, out_dir, s)
     proj.ingest()
     proj.align()
+    proj._image_quality()
     proj.save(proj.out / f"{name}_project.pkl")
+    proj.feats.clear()          # features are not needed any more; free memory for rendering
     if render:
         proj.render(name)
     else:

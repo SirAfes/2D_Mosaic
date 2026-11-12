@@ -89,3 +89,18 @@ def test_project_rerender(tmp_path):
     a = rawio.read_image(tmp_path / "out" / "mosaic.tif")
     b = rawio.read_image(tmp_path / "out2" / "again.tif")
     assert abs(b.shape[1] / a.shape[1] - 2 / 3) < 0.02
+
+
+def test_blurred_frame_detected_from_overlaps(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=4, n_rows=1)
+    blurred = src / "IMG_002.tif"
+    img = cv2.imread(str(blurred), cv2.IMREAD_UNCHANGED)
+    cv2.imwrite(str(blurred), cv2.GaussianBlur(img, (0, 0), 2.5))
+    s = Settings(methods="sift", accuracy="high", resolution=0.25, distortion=False,
+                 n_features=3000, jobs=2)
+    proj, rep = run(src, tmp_path / "out", s)
+    q = {f.path.name: f.quality for f in proj.frames}
+    assert q["IMG_002.tif"] < 0.5, q
+    assert all(v > 0.7 for k, v in q.items() if k != "IMG_002.tif"), q
