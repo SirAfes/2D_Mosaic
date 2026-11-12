@@ -74,3 +74,18 @@ def test_synthetic_survey(tmp_path, blend):
     assert (img > 0).mean() > 0.4
     rep2 = json.loads((tmp_path / "out" / "mosaic_report.json").read_text())
     assert rep2["pairs_accepted"] >= len(truth) - 1
+
+
+def test_project_rerender(tmp_path):
+    from mosaic2d.pipeline import Project
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=3, n_rows=1)
+    s = Settings(methods="orb", accuracy="high", resolution=0.3, distortion=False, n_features=2000, jobs=2)
+    run(src, tmp_path / "out", s)
+    proj = Project.load(tmp_path / "out" / "mosaic_project.pkl", tmp_path / "out2",
+                        blend="disabled", resolution=0.2)
+    proj.render("again")
+    a = rawio.read_image(tmp_path / "out" / "mosaic.tif")
+    b = rawio.read_image(tmp_path / "out2" / "again.tif")
+    assert abs(b.shape[1] / a.shape[1] - 2 / 3) < 0.02

@@ -65,6 +65,15 @@ def build_parser():
     r.add_argument("--keep-canvas", action="store_true")
     r.add_argument("--tiles", type=int, default=0, dest="tile_size",
                    help="split the output into tiles of this size (px) plus a .vrt that joins them")
+    rr = sub.add_parser("render", help="render again from a saved project (<name>_project.pkl)")
+    rr.add_argument("project")
+    rr.add_argument("-o", "--out", default=None)
+    rr.add_argument("--blend", default=None, choices=["mosaic", "average", "disabled"])
+    rr.add_argument("--resolution", type=float, default=None)
+    rr.add_argument("--orient", default=None, choices=["pca", "anchor"])
+    rr.add_argument("--tiles", type=int, default=None, dest="tile_size")
+    rr.add_argument("--work-dir", default=None)
+    rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
     _add_common(b)
     sub.add_parser("methods", help="list feature methods")
@@ -77,6 +86,13 @@ def main(argv=None):
         reg = FT.build_registry()
         for m in reg.values():
             print(f"{m.name:12s} {'available ' if m.available else 'MISSING   '} {m.family:6s}  {m.note}")
+        return 0
+    if args.cmd == "render":
+        from .pipeline import Project
+        proj = Project.load(args.project, args.out, blend=args.blend, resolution=args.resolution,
+                            orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir)
+        proj.render(args.name)
+        proj.report(args.name)
         return 0
     known = {f.name for f in fields(Settings)}
     s = Settings(**{k: v for k, v in vars(args).items() if k in known and v is not None})

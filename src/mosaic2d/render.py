@@ -9,9 +9,11 @@ written strip by strip.
 
 Which frame supplies a pixel (the *seam* layout) is decided analytically: the
 frame in which the pixel lies closest to the image centre wins (elliptical
-distance, normalised by the valid image size). This is the rule Metashape uses
-when blending is disabled; it keeps every pixel from its least distorted, best
-lit view and needs no global label image.
+distance, normalised by the valid image size) -- the rule Metashape uses when
+blending is disabled; it keeps every pixel from its least distorted, best lit
+view and needs no global label image. The distance is multiplied by a
+per-frame sharpness penalty, so a blurred frame (motion, focus) gives way to
+sharper overlapping frames and only fills areas nobody else covers.
 
 Blending modes (names follow Metashape):
 
@@ -48,6 +50,7 @@ class RenderFrame:
     lens_A: dict                  # lens -> 3x3, lens px -> ref px
     thumb: np.ndarray | None = None   # h_t x w_t x B (in ref px * thumb_scale)
     thumb_scale: float = 1.0
+    penalty: float = 1.0          # seam score multiplier (>1 = blurrier than its neighbours)
     Hinv: np.ndarray = field(default=None)
     bbox: tuple = (0, 0, 0, 0)    # x0, y0, x1, y1 in output px
 
@@ -113,7 +116,7 @@ def _score(fr: RenderFrame, u, v, dist: Distortion):
     x0, y0, x1, y1 = fr.valid
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     hw, hh = (x1 - x0) / 2, (y1 - y0) / 2
-    s = ((ud - cx) / hw) ** 2 + ((vd - cy) / hh) ** 2
+    s = (((ud - cx) / hw) ** 2 + ((vd - cy) / hh) ** 2) * fr.penalty
     valid = (ud >= x0) & (ud <= x1) & (vd >= y0) & (vd <= y1)
     if dist.active:
         # the inverse distortion is only meaningful near the image; far outside
@@ -228,6 +231,35 @@ class Renderer:
         return [g for g in self.frames if g is not fr and g.bbox[0] < x1 and g.bbox[2] > x0
                 and g.bbox[1] < y1 and g.bbox[3] > y0]
 
+    def _lose_mask(self, fr, others, X, Y, x0, x1, ys, ye, step=4):
+        """
+        Pixels of the strip that another frame wins (seam decision).
+
+        Evaluated on a grid of every `step`-th pixel and upsampled: seam
+        positions only need to be approximately right, and this is ~step^2
+        times cheaper with many overlapping frames. The coarse mask is eroded
+        by one cell so that, near any boundary, the current frame keeps the
+        pixel -- coarse decisions can therefore create small overlaps (later
+        frames overwrite) but never holes.
+        """
+        h, w = X.shape
+        cand = [g for g in others if g.bbox[0] < x1 and g.bbox[2] > x0
+                and g.bbox[1] < ye and g.bbox[3] > ys]
+        if not cand:
+            return np.zeros((h, w), bool)
+        Xc, Yc = X[::step, ::step], Y[::step, ::step]
+        uc, vc = _map(fr, Xc, Yc)
+        sc, _, _, _ = _score(fr, uc, vc, self.dist)
+        lose = np.zeros(Xc.shape, bool)
+        for g in cand:
+            ug, vg = _map(g, Xc, Yc)
+            sg, vgm, _, _ = _score(g, ug, vg, self.dist)
+            lose |= vgm & ((sg < sc) | ((sg == sc) & (g.index < fr.index)))
+        if not lose.any():
+            return np.zeros((h, w), bool)
+        lose = cv2.erode(lose.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        return np.repeat(np.repeat(lose, step, 0), step, 1)[:h, :w]
+
     def render(self, load_lenses, out_name="mosaic"):
         """load_lenses(frame) -> {lens: H x W x C array}. Returns the memmap."""
         shape = (self.H, self.W, self.B)
@@ -261,14 +293,7 @@ class Renderer:
                 if self.blend == "average":
                     sel = valid
                 else:
-                    sel = valid.copy()
-                    for g in others:
-                        ug, vg = _map(g, X, Y)
-                        sg, vgm, _, _ = _score(g, ug, vg, self.dist)
-                        beats = vgm & ((sg < s) | ((sg == s) & (g.index < fr.index)))
-                        sel &= ~beats
-                        if not sel.any():
-                            break
+                    sel = valid & ~self._lose_mask(fr, others, X, Y, x0, x1, ys, ye)
                 if not sel.any():
                     continue
                 rows = np.where(sel.any(1))[0]

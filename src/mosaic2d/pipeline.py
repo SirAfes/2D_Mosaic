@@ -93,6 +93,21 @@ class Frame:
     valid: tuple = (0, 0, 0, 0)
     thumb: np.ndarray | None = None
     thumb_scale: float = 1.0
+    sharpness: float = 0.0            # Laplacian energy of the working image
+    quality: float = 1.0              # sharpness relative to the series median
+
+
+def image_sharpness(img_u8: np.ndarray) -> float:
+    """Mean squared Laplacian of the (contrast-normalised) working image, central 80 %."""
+    h, w = img_u8.shape[:2]
+    c = img_u8[h // 10: h - h // 10, w // 10: w - w // 10]
+    g = cv2.GaussianBlur(c.astype(np.float32), (0, 0), 1.0)
+    return float(cv2.Laplacian(g, cv2.CV_32F).var())
+
+
+def seam_penalty(quality: float) -> float:
+    """Seam score multiplier: blurred frames (quality < 1) lose overlaps to sharper ones."""
+    return float(np.clip(1.0 / max(quality, 1e-3) ** 2, 0.5, 25.0))
 
 
 class Log:
@@ -201,6 +216,7 @@ class Project:
         if fr.work_scale != 1.0:
             g = cv2.resize(g, None, fx=fr.work_scale, fy=fr.work_scale, interpolation=cv2.INTER_AREA)
         fr.reg = SR.normalise_for_features(g)
+        fr.sharpness = image_sharpness(fr.reg)
         # valid rectangle (in ref px) shared by all lenses
         m = 2.0
         x0, y0, x1, y1 = m, m, w - m, h - m
@@ -253,7 +269,18 @@ class Project:
         self.frames = frames
         if self.prof.multilens:
             self._lens_consensus()
+        self._image_quality()
         self.timing["ingest_s"] = time.time() - t
+
+    def _image_quality(self):
+        """Relative sharpness per frame (comparable to Metashape's image quality)."""
+        med = float(np.median([f.sharpness for f in self.frames])) or 1.0
+        for f in self.frames:
+            f.quality = f.sharpness / med
+        low = [f.path.name for f in self.frames if f.quality < 0.5]
+        if low:
+            self.log(f"  {len(low)} blurred frame(s) (quality < 0.5 of median): {', '.join(low)} "
+                     "-- used only where no sharper frame overlaps")
 
     def _lens_consensus(self):
         res = [f.lens for f in self.frames]
@@ -469,6 +496,34 @@ class Project:
                 self.match(extra)
                 self.adjust()
 
+    # ------------------------------------------------------------------ project file
+    def save(self, path):
+        """Save the aligned project (no features, no log handle) for later rendering."""
+        import pickle
+        state = {k: v for k, v in self.__dict__.items() if k not in ("feats", "log", "registry")}
+        for fr in state["frames"]:
+            fr.reg = None  # working images are not needed for rendering
+        with open(path, "wb") as fh:
+            pickle.dump({"mosaic2d": __version__, "state": state}, fh, protocol=4)
+
+    @classmethod
+    def load(cls, path, out_dir=None, **overrides):
+        import pickle
+        with open(path, "rb") as fh:
+            d = pickle.load(fh)
+        proj = cls.__new__(cls)
+        proj.__dict__.update(d["state"])
+        for k, v in overrides.items():
+            if v is not None:
+                setattr(proj.s, k, v)
+        if out_dir:
+            proj.out = Path(out_dir)
+        proj.out.mkdir(parents=True, exist_ok=True)
+        proj.log = Log(proj.out / "mosaic2d_render.log")
+        proj.feats = {}
+        proj.registry = FT.build_registry(proj.s.n_features)
+        return proj
+
     # ------------------------------------------------------------------ output
     def output_transform(self, resolution=None, orient=None):
         """Similarity T (mosaic px -> output px) and canvas size."""
@@ -511,7 +566,8 @@ class Project:
             A = {1: np.eye(3)} if fr.lens is None else {
                 ln: fr.lens.A(ln) for ln in range(1, self.prof.n_lenses + 1)}
             out.append(RD.RenderFrame(fr.index, str(fr.path), T @ r.H[fr.index], fr.ref_size,
-                                      fr.valid, A, fr.thumb, fr.thumb_scale))
+                                      fr.valid, A, fr.thumb, fr.thumb_scale,
+                                      penalty=seam_penalty(fr.quality)))
         return out
 
     def band_sources(self):
@@ -535,7 +591,7 @@ class Project:
             frames.append(RD.RenderFrame(fr.index, "", Hs,
                                          (fr.thumb.shape[1], fr.thumb.shape[0]),
                                          (x0 * ts, y0 * ts, x1 * ts, y1 * ts), {0: np.eye(3)},
-                                         fr.thumb, 1.0))
+                                         fr.thumb, 1.0, penalty=seam_penalty(fr.quality)))
         ts0 = self.frames[0].thumb_scale
         dist = RD.Distortion(r.k, r.center * ts0, r.radius * ts0)
         nb = self.frames[0].thumb.shape[2]
@@ -683,7 +739,7 @@ class Project:
                             "|".join(p.tried), p.reason])
         with open(self.out / f"{name}_images.csv", "w", newline="") as fh:
             w = csv.writer(fh)
-            hdr = ["image", "aligned", "pairs", "rmse_px", "time"]
+            hdr = ["image", "aligned", "pairs", "rmse_px", "quality", "time"]
             if self.prof.multilens:
                 hdr += [f"lens{ln}_{k}" for ln in range(1, self.prof.n_lenses + 1) for k in ("dx", "dy", "ncc", "method")]
             w.writerow(hdr)
@@ -691,7 +747,7 @@ class Project:
                 pi = r.per_image.get(fr.index, {}) if r else {}
                 row = [fr.path.name, int(fr.index in main), pi.get("pairs", 0),
                        f"{pi['rmse_px']:.3f}" if pi.get("rmse_px") is not None else "",
-                       fr.exif.get("datetime_original", "")]
+                       f"{fr.quality:.2f}", fr.exif.get("datetime_original", "")]
                 if self.prof.multilens:
                     for ln in range(1, self.prof.n_lenses + 1):
                         if ln == fr.lens.ref_lens:
@@ -731,6 +787,7 @@ def run(inputs, out_dir, settings: Settings | None = None, name="mosaic", render
     proj = Project(inputs, out_dir, s)
     proj.ingest()
     proj.align()
+    proj.save(proj.out / f"{name}_project.pkl")
     if render:
         proj.render(name)
     else:
