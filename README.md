@@ -81,6 +81,10 @@ Band names and wavelengths are written to GDAL metadata, so QGIS shows "405 nm" 
 
 **Rendering.** The canvas is a disk-backed memmap; frames are decoded one at a time. Each output pixel comes from the frame in which it lies closest to the image centre (Metashape's rule). `mosaic` blending keeps the high frequencies of that frame and harmonises low frequencies across overlaps (a smooth per-frame gain field), which removes brightness steps from vignetting or strobes without ghosting. Use `--blend disabled` for quantitative multispectral analysis: pixel values are then exactly those of the source frames.
 
+## Benchmark
+
+On an underwater RGB survey (57 × 61 MP Sony ARW) every method aligned all images; RootSIFT/SIFT were the most accurate, FAST variants the weakest across survey lanes. Details: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
 ## Limits
 
 A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax that no planar transform can remove — seams are placed near frame centres to keep it small; for true orthomosaics of rough terrain use SfM software with a dense surface model. Moving objects (a floating transect line, fish) can appear twice or be cut at a seam. The geometry is relative (pixels), not georeferenced.
