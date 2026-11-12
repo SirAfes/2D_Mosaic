@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosaic2d"
+dynamic = ["version"]
+description = "2D mosaics from overlapping RGB and multispectral photographs (multi-method feature matching, global bundle adjustment)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Ahmet F. Semerci" }]
+requires-python = ">=3.10"
+# opencv-contrib-python contains everything in opencv-python plus AKAZE/KAZE/BRISK/BEBLID
+# (moved to contrib in OpenCV 5). Do not install both packages side by side.
+dependencies = ["numpy>=1.24", "opencv-contrib-python>=4.8"]
+keywords = ["mosaic", "image stitching", "orthomosaic", "multispectral", "underwater", "photogrammetry"]
+
+[project.optional-dependencies]
+raw = ["rawpy>=0.24"]
+dev = ["pytest>=8", "tifffile>=2024.1"]
+
+[project.scripts]
+mosaic2d = "mosaic2d.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "mosaic2d.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

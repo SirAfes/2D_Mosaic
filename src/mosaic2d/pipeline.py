@@ -1,0 +1,809 @@
+"""
+pipeline.py
+
+End-to-end 2D mosaicking, modelled on the photo-alignment and orthomosaic
+steps of photogrammetry software such as Agisoft Metashape, reduced to a
+planar (2D) scene model:
+
+  1. Ingest      decode frames; for multi-lens cameras register every lens to
+                 the reference lens (bands.py); choose the reference band.
+  2. Features    one or several detector/descriptor methods (features.py).
+  3. Pairs       pair preselection: sequential neighbours + "generic"
+                 (all-pairs matching on small thumbnails) and, after a first
+                 solution, "estimated" (pairs whose footprints overlap).
+  4. Matching    per pair a method cascade (first method that passes all
+                 checks wins), a pooled union of methods, or a single method;
+                 phase correlation as a last resort for low-texture neighbours.
+  5. Adjustment  global bundle adjustment of all transforms, optional radial
+                 distortion self-calibration, iterative outlier removal.
+  6. Render      out-of-core mosaic with seam selection and blending.
+  7. Report      JSON / Markdown / CSV, seam map and preview.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from . import __version__
+from . import bands as BD
+from . import bundle as BA
+from . import features as FT
+from . import matching as MT
+from . import render as RD
+from . import sources as SR
+from .tiffwriter import write_tiff, write_tiled
+
+ACCURACY = {"highest": 6000, "high": 3600, "medium": 2400, "low": 1200, "lowest": 700}
+
+
+@dataclass
+class Settings:
+    profile: str = "auto"            # auto | rgb | agrowing6 | multiband | profile.json
+    methods: str = "auto"            # auto | comma list (see `mosaic2d methods`)
+    strategy: str = "cascade"        # cascade | union | single
+    cascade_limit: int = 4           # max. methods tried per pair (cascade)
+    model: str = "homography"        # translation | similarity | affine | homography
+    accuracy: str = "medium"         # working resolution for matching (max side px)
+    n_features: int = 8000
+    preselection: str = "auto"       # auto | sequential | generic | exhaustive
+    window: int = 3                  # sequential neighbours
+    distortion: bool = True          # self-calibrate radial distortion k1, k2
+    ref_band: str | None = None      # e.g. "560 nm"; None = automatic
+    blend: str = "mosaic"            # mosaic | average | disabled
+    resolution: float = 1.0          # output px per native px of the reference lens
+    orient: str = "pca"              # pca (long axis horizontal) | anchor
+    demosaic: str | None = None      # superpixel | bilinear (RAW); None = profile default
+    phasecorr: bool = True
+    lens_affine: bool = True
+    jobs: int = 0
+    max_images: int = 0
+    work_dir: str | None = None
+    keep_canvas: bool = False
+    tile_size: int = 0               # >0: write tiles of this size + a VRT instead of one TIFF
+    ratio: float = 0.8
+    ransac_px: float = 3.0
+    min_inliers: int = 25
+    guided: bool = True
+
+    def match_params(self) -> MT.MatchParams:
+        return MT.MatchParams(ratio=self.ratio, ransac_px=self.ransac_px,
+                              min_inliers=self.min_inliers, guided=self.guided)
+
+
+@dataclass
+class Frame:
+    index: int
+    path: Path
+    exif: dict
+    ref_size: tuple = (0, 0)          # native px of the reference lens image
+    work_scale: float = 1.0
+    reg: np.ndarray | None = None     # uint8 working image of the reference band
+    lens: BD.FrameLensAlignment | None = None
+    valid: tuple = (0, 0, 0, 0)
+    thumb: np.ndarray | None = None
+    thumb_scale: float = 1.0
+
+
+class Log:
+    def __init__(self, path: Path | None = None, quiet=False):
+        self.t0 = time.time()
+        self.fh = open(path, "w", encoding="utf-8") if path else None
+        self.quiet = quiet
+
+    def __call__(self, *msg):
+        line = f"[{time.time() - self.t0:7.1f}s] " + " ".join(str(m) for m in msg)
+        if not self.quiet:
+            print(line, flush=True)
+        if self.fh:
+            self.fh.write(line + "\n")
+            self.fh.flush()
+
+
+class Project:
+    def __init__(self, inputs, out_dir, settings: Settings, log: Log | None = None):
+        self.s = settings
+        self.out = Path(out_dir)
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.log = log or Log(self.out / "mosaic2d.log")
+        self.files = SR.list_images(inputs)
+        if settings.max_images:
+            self.files = self.files[: settings.max_images]
+        if len(self.files) < 2:
+            raise ValueError("Need at least two images")
+        prof_name = settings.profile
+        if prof_name == "auto":
+            prof_name = SR.detect_profile(self.files[0])
+        self.prof = SR.get_profile(prof_name, self.files[0])
+        self.registry = FT.build_registry(settings.n_features)
+        self.methods = FT.resolve_methods(settings.methods, self.registry)
+        if not self.methods:
+            raise ValueError("None of the requested feature methods is available")
+        self.feats: dict = {}
+        self.frames: list[Frame] = []
+        self.pairs: dict = {}            # (i, j) -> PairResult (accepted or not)
+        self.ref_band: SR.Band | None = None
+        self.band_scores: dict = {}
+        self.jobs = settings.jobs or min(4, os.cpu_count() or 1)
+        self.result: BA.BundleResult | None = None
+        self.timing: dict = {}
+
+    # ------------------------------------------------------------------ ingest
+    def _work_scale(self, w, h):
+        return min(1.0, ACCURACY[self.s.accuracy] / max(w, h))
+
+    def _select_reference_band(self):
+        prof = self.prof
+        if len(prof.bands) == 1:
+            self.ref_band = prof.bands[0]
+            return
+        if self.s.ref_band:
+            want = self.s.ref_band.strip().lower().replace("nm", "").strip()
+            for b in prof.bands:
+                if b.name.lower().replace("nm", "").strip() == want:
+                    self.ref_band = b
+                    return
+            raise ValueError(f"Reference band '{self.s.ref_band}' not in profile: "
+                             + ", ".join(b.name for b in prof.bands))
+        if not prof.multilens and prof.name == "rgb":
+            self.ref_band = None  # luminance of all channels
+            return
+        n = len(self.files)
+        k = min(6, n)
+        start = max(0, n // 2 - k // 2)
+        sample = [SR.load_frame(f, prof, self.s.demosaic) for f in self.files[start:start + k]]
+        any_lens = sample[0].lenses[prof.bands[0].lens]
+        ws = self._work_scale(any_lens.shape[1], any_lens.shape[0])
+        meth = self.registry[self.methods[0]].build
+        p = self.s.match_params()
+        p.guided = False
+        best, scores = BD.choose_reference_band(
+            sample, prof, lambda g: meth(g), lambda a, b: MT.match_pair(a, b, 0, 1, p), ws, self.log)
+        self.ref_band, self.band_scores = best, scores
+        self.log(f"  reference band: {best.name} (lens {best.lens})")
+
+    def _reg_image(self, fd: SR.FrameData):
+        if self.ref_band is None:
+            g = SR.to_gray_float(fd.lenses[1])
+        else:
+            g = SR.band_image(fd, self.ref_band).astype(np.float32)
+        return g
+
+    def _ingest_one(self, idx: int, path: Path, priors=None):
+        prof = self.prof
+        fd = SR.load_frame(path, prof, self.s.demosaic)
+        ref_lens = self.ref_band.lens if self.ref_band else 1
+        ref_img = fd.lenses[ref_lens]
+        h, w = ref_img.shape[:2]
+        fr = Frame(idx, path, fd.exif, (w, h))
+        if prof.multilens:
+            fr.lens = BD.align_frame_lenses(fd, prof, ref_lens, scale=min(1.0, 1400 / max(w, h)),
+                                            priors=priors, max_dev=40 if priors else None,
+                                            affine=self.s.lens_affine)
+        self._finish_frame(fr, fd)
+        return fr
+
+    def _finish_frame(self, fr: Frame, fd: SR.FrameData):
+        prof = self.prof
+        w, h = fr.ref_size
+        g = self._reg_image(fd)
+        fr.work_scale = self._work_scale(w, h)
+        if fr.work_scale != 1.0:
+            g = cv2.resize(g, None, fx=fr.work_scale, fy=fr.work_scale, interpolation=cv2.INTER_AREA)
+        fr.reg = SR.normalise_for_features(g)
+        # valid rectangle (in ref px) shared by all lenses
+        m = 2.0
+        x0, y0, x1, y1 = m, m, w - m, h - m
+        if fr.lens is not None:
+            for ln in range(1, prof.n_lenses + 1):
+                if ln == fr.lens.ref_lens:
+                    continue
+                lh, lw = fd.lenses[ln].shape[:2]
+                c = np.array([[0, 0], [lw, 0], [lw, lh], [0, lh]], np.float64)
+                pc = cv2.perspectiveTransform(c[None], fr.lens.A(ln))[0]
+                x0 = max(x0, pc[0, 0], pc[3, 0]) + 0
+                x1 = min(x1, pc[1, 0], pc[2, 0])
+                y0 = max(y0, pc[0, 1], pc[1, 1])
+                y1 = min(y1, pc[2, 1], pc[3, 1])
+            x0, y0, x1, y1 = x0 + m, y0 + m, x1 - m, y1 - m
+        fr.valid = (float(x0), float(y0), float(x1), float(y1))
+        # thumbnail of all output bands in reference-lens coordinates
+        ts = min(1.0, 400.0 / max(w, h))
+        tw, th = max(1, int(round(w * ts))), max(1, int(round(h * ts)))
+        S = np.diag([ts, ts, 1.0])
+        chans = []
+        for b in prof.output_bands():
+            img = SR.band_image(fd, b).astype(np.float32)
+            lh, lw = img.shape[:2]
+            small = cv2.resize(img, (max(1, int(round(lw * ts))), max(1, int(round(lh * ts)))),
+                               interpolation=cv2.INTER_AREA)
+            A = np.eye(3) if fr.lens is None else fr.lens.A(b.lens)
+            M = S @ A @ np.linalg.inv(S)
+            chans.append(cv2.warpPerspective(small, M, (tw, th), flags=cv2.INTER_LINEAR))
+        fr.thumb = np.clip(np.dstack(chans), 0, 65535).astype(np.uint16)
+        fr.thumb_scale = ts
+
+    def ingest(self):
+        t = time.time()
+        self.log(f"mosaic2d {__version__}: {len(self.files)} images, profile '{self.prof.name}', "
+                 f"methods {','.join(self.methods)}, strategy {self.s.strategy}, model {self.s.model}")
+        self._select_reference_band()
+        frames = [None] * len(self.files)
+        done = [0]
+
+        def work(i):
+            fr = self._ingest_one(i, self.files[i])
+            done[0] += 1
+            if done[0] % 10 == 0 or done[0] == len(self.files):
+                self.log(f"  ingested {done[0]}/{len(self.files)}")
+            return fr
+        with ThreadPoolExecutor(self.jobs) as ex:
+            for fr in ex.map(work, range(len(self.files))):
+                frames[fr.index] = fr
+        self.frames = frames
+        if self.prof.multilens:
+            self._lens_consensus()
+        self.timing["ingest_s"] = time.time() - t
+
+    def _lens_consensus(self):
+        res = [f.lens for f in self.frames]
+        med, bad = BD.consensus_check(res)
+        lenses_txt = ", ".join(
+            f"L{ln}: ({A[0, 2]:+.1f}, {A[1, 2]:+.1f}) px" for ln, A in sorted(med.items()))
+        self.log(f"  lens offsets to reference lens {res[0].ref_lens} (series median): {lenses_txt}")
+        if not bad:
+            return
+        frames_bad = sorted({k for k, _ in bad})
+        self.log(f"  {len(bad)} lens alignment(s) disagree with the series in "
+                 f"{len(frames_bad)} frame(s); re-estimating around the series median")
+        for k in frames_bad:
+            fr = self.frames[k]
+            new = self._ingest_one(k, fr.path, priors=med)
+            for ln in new.lens.lenses:
+                old = fr.lens.lenses[ln]
+                if (k, ln) in bad and new.lens.lenses[ln].ncc < 0.5 * np.median(
+                        [f.lens.lenses[ln].ncc for f in self.frames]):
+                    new.lens.lenses[ln] = BD.LensResult(med[ln].copy(), "series_median", old.ncc)
+            if any(new.lens.lenses[ln].method == "series_median" for ln in new.lens.lenses):
+                fd = SR.load_frame(fr.path, self.prof, self.s.demosaic)
+                self._finish_frame(new, fd)
+            self.frames[k] = new
+
+    # ---------------------------------------------------------------- features
+    def features(self, method: str, i: int) -> FT.Features:
+        key = (method, i)
+        if key not in self.feats:
+            self.feats[key] = self.registry[method].build(self.frames[i].reg)
+        return self.feats[key]
+
+    def compute_features(self, methods):
+        t = time.time()
+        todo = [(m, i) for m in methods for i in range(len(self.frames)) if (m, i) not in self.feats]
+        with ThreadPoolExecutor(self.jobs) as ex:
+            for (m, i), f in zip(todo, ex.map(lambda mi: self.registry[mi[0]].build(self.frames[mi[1]].reg), todo)):
+                self.feats[(m, i)] = f
+        self.timing["features_s"] = self.timing.get("features_s", 0) + time.time() - t
+
+    # ------------------------------------------------------------- preselection
+    def generic_candidates(self, min_inliers=12) -> dict:
+        """All-pairs matching on small thumbnails ('generic preselection')."""
+        t = time.time()
+        meth = "sift" if "sift" in self.registry and self.registry["sift"].available else self.methods[0]
+        small, sc = [], []
+        for fr in self.frames:
+            s = min(1.0, 900.0 / max(fr.reg.shape))
+            small.append(cv2.resize(fr.reg, None, fx=s, fy=s, interpolation=cv2.INTER_AREA))
+            sc.append(s)
+        reg = FT.build_registry(1500)
+        feats = list(ThreadPoolExecutor(self.jobs).map(reg[meth].build, small))
+        p = MT.MatchParams(min_inliers=min_inliers, guided=False, ransac_px=3.0, min_coverage=0.003)
+        n = len(self.frames)
+        allp = [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+        def m(ij):
+            i, j = ij
+            r = MT.match_pair(feats[i], feats[j], i, j, p)
+            return ij, (r.n_inliers if r.ok else 0)
+        with ThreadPoolExecutor(self.jobs) as ex:
+            scores = dict(ex.map(m, allp))
+        self.timing["preselection_s"] = time.time() - t
+        return {k: v for k, v in scores.items() if v > 0}
+
+    def candidate_pairs(self) -> list:
+        n = len(self.frames)
+        mode = self.s.preselection
+        cand = set()
+        if mode in ("auto", "sequential"):
+            for i in range(n):
+                for d in range(1, self.s.window + 1):
+                    if i + d < n:
+                        cand.add((i, i + d))
+        if mode == "exhaustive":
+            cand |= {(i, j) for i in range(n) for j in range(i + 1, n)}
+        self.generic_scores = {}
+        if mode in ("auto", "generic") and n <= 600:
+            self.generic_scores = self.generic_candidates()
+            cand |= set(self.generic_scores)
+            self.log(f"  generic preselection: {len(self.generic_scores)} overlapping pairs found "
+                     f"among {n * (n - 1) // 2}")
+        return sorted(cand)
+
+    # ------------------------------------------------------------------ matching
+    def match(self, pairs, methods=None, strategy=None, trusted=False):
+        methods = methods or self.methods
+        strategy = strategy or self.s.strategy
+        p = self.s.match_params()
+        t = time.time()
+        if strategy == "single":
+            methods = methods[:1]
+        need = methods if strategy != "cascade" else methods[:1]
+        self.compute_features(need)
+
+        def one(ij):
+            i, j = ij
+            scale_i, scale_j = self.frames[i].work_scale, self.frames[j].work_scale
+            tried = []
+            res = None
+            if strategy == "union":
+                res = MT.match_pair_union([self.features(m, i) for m in methods],
+                                          [self.features(m, j) for m in methods], i, j, p)
+                tried = list(methods)
+            else:
+                limit = self.s.cascade_limit if strategy == "cascade" else 1
+                # far pairs that the thumbnail check found no overlap for: primary method only
+                far = (not trusted and (j - i > 1) and bool(self.generic_scores)
+                       and (ij not in self.generic_scores))
+                for m in methods[: (1 if far else limit)]:
+                    r = MT.match_pair(self.features(m, i), self.features(m, j), i, j, p)
+                    tried.append(m)
+                    if res is None or r.n_inliers > res.n_inliers or r.ok:
+                        res = r
+                    if r.ok:
+                        break
+            if (not res.ok and self.s.phasecorr and j - i == 1 and strategy != "single"):
+                r = MT.phase_correlation_pair(self.frames[i].reg, self.frames[j].reg, i, j)
+                tried.append("phasecorr")
+                if r.ok:
+                    res = r
+            res.tried = tried
+            return ij, res
+        with ThreadPoolExecutor(self.jobs) as ex:
+            for ij, r in ex.map(one, pairs):
+                self.pairs[ij] = r
+        self.timing["matching_s"] = self.timing.get("matching_s", 0) + time.time() - t
+        ok = sum(1 for ij in pairs if self.pairs[ij].ok)
+        self.log(f"  matched {len(pairs)} pairs: {ok} accepted")
+
+    # ---------------------------------------------------------------- adjustment
+    def _corr(self):
+        corr, pairH, sizes = [], {}, {}
+        for fr in self.frames:
+            sizes[fr.index] = fr.ref_size
+        for (i, j), r in self.pairs.items():
+            if not r.ok:
+                continue
+            si, sj = self.frames[i].work_scale, self.frames[j].work_scale
+            p = r.pts_i / si
+            q = r.pts_j / sj
+            Hn = np.diag([1 / sj, 1 / sj, 1]) @ r.H @ np.diag([si, si, 1])
+            w = 0.3 if r.method == "phasecorr" else 1.0
+            corr.append(BA.Correspondences(i, j, p, q, w, r.method))
+            pairH[(i, j)] = Hn
+        return corr, pairH, sizes
+
+    def adjust(self):
+        t = time.time()
+        corr, pairH, sizes = self._corr()
+        nodes = [f.index for f in self.frames]
+        if not corr:
+            raise RuntimeError("No image pair could be matched")
+        self.result = BA.run_bundle(nodes, corr, pairH, sizes, model=self.s.model,
+                                    distortion=self.s.distortion, log=self.log)
+        r = self.result
+        for rem in r.removed_pairs:
+            key = (rem["i"], rem["j"])
+            if key in self.pairs:
+                self.pairs[key].ok = False
+                self.pairs[key].reason = f"rejected by adjustment (median {rem['median_px']} px)"
+        n_main = len(r.components[0])
+        self.log(f"  adjustment: {n_main}/{len(nodes)} images in the main block, "
+                 f"RMSE {r.rmse_px:.2f} px, median {r.median_px:.2f} px, "
+                 f"k1={r.k[0]:+.4f} k2={r.k[1]:+.4f}, anchor {self.frames[r.anchor].path.name}")
+        self.timing["adjustment_s"] = self.timing.get("adjustment_s", 0) + time.time() - t
+
+    def estimated_pairs(self, min_overlap=0.12) -> list:
+        """Pairs whose adjusted footprints overlap but were never matched."""
+        r = self.result
+        dist = RD.Distortion(r.k, r.center, r.radius)
+        polys = {}
+        for fr in self.frames:
+            if fr.index in r.H:
+                rf = RD.RenderFrame(fr.index, str(fr.path), r.H[fr.index], fr.ref_size, fr.valid, {})
+                polys[fr.index] = cv2.convexHull(RD.footprint(rf, dist, 4).astype(np.float32))
+        new = []
+        keys = sorted(polys)
+        for a in range(len(keys)):
+            for b in range(a + 1, len(keys)):
+                i, j = keys[a], keys[b]
+                if (i, j) in self.pairs:
+                    continue
+                inter, _ = cv2.intersectConvexConvex(polys[i], polys[j])
+                if inter <= 0:
+                    continue
+                frac = inter / min(cv2.contourArea(polys[i]), cv2.contourArea(polys[j]))
+                if frac >= min_overlap:
+                    new.append((i, j))
+        return new
+
+    def align(self):
+        """Steps 2-5 (features, pairs, matching, adjustment)."""
+        pairs = self.candidate_pairs()
+        self.log(f"  {len(pairs)} candidate pairs")
+        self.match(pairs)
+        self.adjust()
+        if self.s.preselection == "auto":
+            extra = self.estimated_pairs()
+            if extra:
+                self.log(f"  estimated preselection: {len(extra)} additional overlapping pairs")
+                self.match(extra, trusted=True)
+                self.adjust()
+        # images outside the main block: try them against everything once more
+        main = set(self.result.components[0])
+        lost = [f.index for f in self.frames if f.index not in main]
+        if lost and self.s.preselection != "exhaustive":
+            extra = [(min(i, j), max(i, j)) for i in lost for j in main
+                     if (min(i, j), max(i, j)) not in self.pairs]
+            extra = [ij for ij in extra if ij in self.generic_scores or abs(ij[0] - ij[1]) <= 6]
+            if extra:
+                self.log(f"  {len(lost)} image(s) not connected; trying {len(extra)} more pairs")
+                self.match(extra)
+                self.adjust()
+
+    # ------------------------------------------------------------------ output
+    def output_transform(self, resolution=None, orient=None):
+        """Similarity T (mosaic px -> output px) and canvas size."""
+        r = self.result
+        resolution = resolution or self.s.resolution
+        orient = orient or self.s.orient
+        dist = RD.Distortion(r.k, r.center, r.radius)
+        pts, centres = [], []
+        for fr in self.frames:
+            if fr.index not in r.H:
+                continue
+            rf = RD.RenderFrame(fr.index, "", r.H[fr.index], fr.ref_size, fr.valid, {})
+            fp = RD.footprint(rf, dist, 6)
+            pts.append(fp)
+            centres.append(fp.mean(0))
+        pts = np.concatenate(pts)
+        R = np.eye(3)
+        if orient == "pca" and len(centres) >= 3:
+            c = np.array(centres)
+            ev, evec = np.linalg.eigh(np.cov((c - c.mean(0)).T))
+            ax = evec[:, np.argmax(ev)]
+            ang = np.arctan2(ax[1], ax[0])
+            ca, sa = np.cos(-ang), np.sin(-ang)
+            R = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]])
+        S = np.diag([resolution, resolution, 1.0])
+        T = S @ R
+        q = cv2.perspectiveTransform(pts[None], T)[0]
+        mn = np.floor(q.min(0)) - 2
+        mx = np.ceil(q.max(0)) + 2
+        T = np.array([[1, 0, -mn[0]], [0, 1, -mn[1]], [0, 0, 1]]) @ T
+        W, H = int(mx[0] - mn[0]), int(mx[1] - mn[1])
+        return T, (W, H)
+
+    def render_frames(self, T):
+        r = self.result
+        out = []
+        for fr in self.frames:
+            if fr.index not in r.H:
+                continue
+            A = {1: np.eye(3)} if fr.lens is None else {
+                ln: fr.lens.A(ln) for ln in range(1, self.prof.n_lenses + 1)}
+            out.append(RD.RenderFrame(fr.index, str(fr.path), T @ r.H[fr.index], fr.ref_size,
+                                      fr.valid, A, fr.thumb, fr.thumb_scale))
+        return out
+
+    def band_sources(self):
+        return [(b.lens, b.channel) for b in self.prof.output_bands()]
+
+    def preview_mosaic(self, max_side=2500, blend="mosaic"):
+        """Fast low-resolution mosaic from the thumbnails (no full decode)."""
+        r = self.result
+        T, (W, H) = self.output_transform(resolution=1.0)
+        f = min(1.0, max_side / max(W, H))
+        T = np.diag([f, f, 1.0]) @ T
+        T, (W, H) = T, (max(1, int(W * f)), max(1, int(H * f)))
+        frames = []
+        for fr in self.frames:
+            if fr.index not in r.H:
+                continue
+            ts = fr.thumb_scale
+            Si = np.diag([1 / ts, 1 / ts, 1.0])
+            Hs = T @ r.H[fr.index] @ Si
+            x0, y0, x1, y1 = fr.valid
+            frames.append(RD.RenderFrame(fr.index, "", Hs,
+                                         (fr.thumb.shape[1], fr.thumb.shape[0]),
+                                         (x0 * ts, y0 * ts, x1 * ts, y1 * ts), {0: np.eye(3)},
+                                         fr.thumb, 1.0))
+        ts0 = self.frames[0].thumb_scale
+        dist = RD.Distortion(r.k, r.center * ts0, r.radius * ts0)
+        nb = self.frames[0].thumb.shape[2]
+        rr = RD.Renderer(frames, dist, (W, H), [(0, b) for b in range(nb)], nb, np.uint16,
+                         blend=blend, strip=4096, log=lambda *a: None,
+                         work_dir=Path(self.s.work_dir or self.out) / "_tmp_preview")
+        thumbs = {fr.index: fr.thumb for fr in frames}
+        canvas = rr.render(lambda fr: {0: thumbs[fr.index]}, out_name="preview")
+        img = np.array(canvas)
+        del canvas
+        try:
+            os.remove(rr.work_dir / "preview.canvas")
+            rr.work_dir.rmdir()
+        except OSError:
+            pass
+        return img, rr
+
+    def vis_channels(self):
+        bands = self.prof.output_bands()
+        if self.prof.name == "rgb" or len(bands) == 3:
+            return (0, 1, 2)
+        wl = [b.wavelength_nm or 0 for b in bands]
+
+        def near(x):
+            return int(np.argmin([abs(w - x) for w in wl]))
+        return (near(650), near(550), near(450))
+
+    def render(self, name="mosaic"):
+        t = time.time()
+        T, (W, H) = self.output_transform()
+        if max(W, H) > 300000:
+            raise RuntimeError(f"Output would be {W} x {H} px - registration is probably wrong, "
+                               "or lower --resolution.")
+        frames = self.render_frames(T)
+        r = self.result
+        dist = RD.Distortion(r.k, r.center, r.radius)
+        bands = self.prof.output_bands()
+        sample = SR.load_frame(self.files[0], self.prof, self.s.demosaic)
+        dtype = next(iter(sample.lenses.values())).dtype
+        del sample
+        work = Path(self.s.work_dir or self.out)
+        rr = RD.Renderer(frames, dist, (W, H), self.band_sources(), len(bands), dtype,
+                         blend=self.s.blend, work_dir=work / "_tmp_canvas", log=self.log,
+                         progress=lambda k, n: (k % 5 == 0 or k == n) and self.log(f"  rendered {k}/{n} frames"))
+        prof = self.prof
+
+        def load(fr):
+            return SR.load_frame(fr.path, prof, self.s.demosaic).lenses
+        canvas = rr.render(load, out_name=name)
+        meta = {"SOFTWARE": f"mosaic2d {__version__}", "PROFILE": prof.name,
+                "BLEND": self.s.blend, "MODEL": self.s.model,
+                "RESOLUTION_REL_NATIVE": self.s.resolution,
+                "REFERENCE_BAND": self.ref_band.name if self.ref_band else "luminance"}
+        names_ = [b.name for b in bands]
+        wls = [b.wavelength_nm for b in bands]
+        if self.s.tile_size and max(W, H) > self.s.tile_size:
+            tif = write_tiled(self.out, name, canvas, names_, wls, 0, self.s.tile_size, meta, self.log)
+            self.log(f"  wrote {tif.name} + tiles")
+        else:
+            tif = self.out / f"{name}.tif"
+            self.log(f"  writing {tif.name}")
+            write_tiff(tif, canvas, band_names=names_, wavelengths=wls, nodata=0,
+                       description=json.dumps({"mosaic2d": __version__, "images": len(frames)}),
+                       metadata=meta)
+        small = RD.downsample(canvas, 3000)
+        cv2.imwrite(str(self.out / f"{name}_preview.jpg"), RD.visualise(small, self.vis_channels()),
+                    [cv2.IMWRITE_JPEG_QUALITY, 90])
+        label, s = rr.seam_map(1600)
+        self._save_seams(label, small, self.out / f"{name}_seams.jpg")
+        np.save(self.out / f"{name}_transforms.npy", {fr.index: fr.H for fr in frames}, allow_pickle=True)
+        canvas_path = rr.work_dir / f"{name}.canvas"
+        del canvas
+        if not self.s.keep_canvas:
+            try:
+                os.remove(canvas_path)
+                rr.work_dir.rmdir()
+            except OSError:
+                pass
+        self.timing["render_s"] = time.time() - t
+        self.canvas_size = (W, H)
+        self.T_out = T
+        return tif
+
+    def _save_seams(self, label, small, path):
+        rng = np.random.default_rng(3)
+        colors = rng.integers(60, 255, (len(self.frames) + 1, 3)).astype(np.uint8)
+        vis = colors[np.clip(label, 0, None)]
+        vis[label < 0] = 0
+        edges = np.zeros(label.shape, bool)
+        edges[:, 1:] |= label[:, 1:] != label[:, :-1]
+        edges[1:, :] |= label[1:, :] != label[:-1, :]
+        if small is not None:
+            base = cv2.resize(RD.visualise(small, self.vis_channels()), label.shape[::-1])
+            vis = cv2.addWeighted(base, 0.65, vis, 0.35, 0)
+        vis[edges] = (255, 255, 255)
+        for fr in self.frames:
+            m = label == fr.index
+            if m.any():
+                ys, xs = np.nonzero(m)
+                cv2.putText(vis, fr.path.stem[-4:], (int(xs.mean()) - 15, int(ys.mean())),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+                cv2.putText(vis, fr.path.stem[-4:], (int(xs.mean()) - 15, int(ys.mean())),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.imwrite(str(path), vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+    # ------------------------------------------------------------------ reports
+    def report(self, name="mosaic"):
+        r = self.result
+        main = set(r.components[0]) if r else set()
+        method_count = {}
+        for p in self.pairs.values():
+            if p.ok:
+                method_count[p.method] = method_count.get(p.method, 0) + 1
+        rep = {
+            "mosaic2d": __version__,
+            "settings": asdict(self.s),
+            "profile": self.prof.name,
+            "images": len(self.frames),
+            "aligned_images": len(main),
+            "not_aligned": [self.frames[i].path.name for i in range(len(self.frames)) if i not in main],
+            "reference_band": self.ref_band.name if self.ref_band else "luminance",
+            "band_scores": self.band_scores,
+            "methods_available": self.methods,
+            "pairs_tried": len(self.pairs),
+            "pairs_accepted": sum(1 for p in self.pairs.values() if p.ok),
+            "pairs_by_method": method_count,
+            "reprojection_rmse_px": r.rmse_px if r else None,
+            "reprojection_median_px": r.median_px if r else None,
+            "distortion_k1_k2": r.k.tolist() if r else None,
+            "anchor": self.frames[r.anchor].path.name if r else None,
+            "canvas_px": getattr(self, "canvas_size", None),
+            "timing_s": {k: round(v, 1) for k, v in self.timing.items()},
+        }
+        (self.out / f"{name}_report.json").write_text(json.dumps(rep, indent=2, default=str))
+        with open(self.out / f"{name}_pairs.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["image_i", "image_j", "accepted", "method", "matches", "inliers",
+                        "inlier_ratio", "coverage", "pair_rmse_px", "adjusted_rmse_px", "tried", "note"])
+            adj = {(d["i"], d["j"]): d["rmse_px"] for d in (r.per_pair if r else [])}
+            for (i, j), p in sorted(self.pairs.items()):
+                w.writerow([self.frames[i].path.name, self.frames[j].path.name, int(p.ok), p.method,
+                            p.n_matches, p.n_inliers, f"{p.inlier_ratio:.3f}", f"{p.coverage:.3f}",
+                            f"{p.rmse:.3f}" if np.isfinite(p.rmse) else "",
+                            f"{adj[(i, j)]:.3f}" if (i, j) in adj else "",
+                            "|".join(p.tried), p.reason])
+        with open(self.out / f"{name}_images.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            hdr = ["image", "aligned", "pairs", "rmse_px", "time"]
+            if self.prof.multilens:
+                hdr += [f"lens{ln}_{k}" for ln in range(1, self.prof.n_lenses + 1) for k in ("dx", "dy", "ncc", "method")]
+            w.writerow(hdr)
+            for fr in self.frames:
+                pi = r.per_image.get(fr.index, {}) if r else {}
+                row = [fr.path.name, int(fr.index in main), pi.get("pairs", 0),
+                       f"{pi['rmse_px']:.3f}" if pi.get("rmse_px") is not None else "",
+                       fr.exif.get("datetime_original", "")]
+                if self.prof.multilens:
+                    for ln in range(1, self.prof.n_lenses + 1):
+                        if ln == fr.lens.ref_lens:
+                            row += [0, 0, 1, "reference"]
+                        else:
+                            lr = fr.lens.lenses[ln]
+                            row += [f"{lr.A[0, 2]:.2f}", f"{lr.A[1, 2]:.2f}", f"{lr.ncc:.3f}", lr.method]
+                w.writerow(row)
+        self._markdown(rep, name)
+        return rep
+
+    def _markdown(self, rep, name):
+        lines = [f"# mosaic2d report — {name}", "",
+                 f"- Images: {rep['images']}, aligned: {rep['aligned_images']}",
+                 f"- Profile: {rep['profile']}, reference band: {rep['reference_band']}",
+                 f"- Feature methods: {', '.join(rep['methods_available'])} "
+                 f"(strategy {self.s.strategy}, model {self.s.model})",
+                 f"- Pairs: {rep['pairs_accepted']} accepted of {rep['pairs_tried']} tried; "
+                 f"by method: {rep['pairs_by_method']}",
+                 f"- Reprojection error: RMSE {rep['reprojection_rmse_px']:.2f} px, "
+                 f"median {rep['reprojection_median_px']:.2f} px (native px of the reference lens)",
+                 f"- Radial distortion k1, k2: {np.round(rep['distortion_k1_k2'], 5).tolist()}",
+                 f"- Canvas: {rep['canvas_px']}", f"- Timing (s): {rep['timing_s']}"]
+        if rep["not_aligned"]:
+            lines.append(f"- **Not aligned:** {', '.join(rep['not_aligned'])}")
+        if self.band_scores:
+            lines += ["", "## Reference band selection (median verified inliers between neighbours)", "",
+                      "| band | inliers |", "|---|---|"]
+            lines += [f"| {k} | {v:.0f} |" for k, v in sorted(self.band_scores.items(), key=lambda kv: -kv[1])]
+        (self.out / f"{name}_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------- API
+
+def run(inputs, out_dir, settings: Settings | None = None, name="mosaic", render=True):
+    s = settings or Settings()
+    proj = Project(inputs, out_dir, s)
+    proj.ingest()
+    proj.align()
+    if render:
+        proj.render(name)
+    else:
+        img, _ = proj.preview_mosaic()
+        cv2.imwrite(str(proj.out / f"{name}_preview.jpg"), RD.visualise(img.astype(np.float32), proj.vis_channels()))
+    rep = proj.report(name)
+    proj.log(f"done: {proj.out}")
+    return proj, rep
+
+
+def benchmark(inputs, out_dir, settings: Settings | None = None, methods="auto"):
+    """
+    Register the same image set with every method separately and compare:
+    accepted pairs, images in the main block, reprojection error, run time.
+    Writes benchmark.csv / benchmark.md and one low-resolution preview per method.
+    """
+    s = settings or Settings()
+    proj = Project(inputs, out_dir, s)
+    proj.ingest()
+    names = FT.resolve_methods(methods, proj.registry)
+    pairs = proj.candidate_pairs()
+    proj.log(f"benchmark: {len(names)} methods on {len(pairs)} candidate pairs")
+    rows = []
+    for m in names:
+        proj.pairs = {}
+        t = time.time()
+        proj.compute_features([m])
+        tf = time.time() - t
+        t = time.time()
+        proj.match(pairs, methods=[m], strategy="single")
+        tm = time.time() - t
+        ok = [p for p in proj.pairs.values() if p.ok]
+        row = {"method": m, "family": proj.registry[m].family,
+               "keypoints_mean": int(np.mean([len(proj.features(m, i).pts) for i in range(len(proj.frames))])),
+               "pairs_accepted": len(ok),
+               "inliers_median": int(np.median([p.n_inliers for p in ok])) if ok else 0,
+               "inlier_ratio_median": round(float(np.median([p.inlier_ratio for p in ok])), 3) if ok else 0,
+               "features_s": round(tf, 1), "matching_s": round(tm, 1)}
+        try:
+            t = time.time()
+            proj.adjust()
+            row.update({"aligned_images": len(proj.result.components[0]),
+                        "rmse_px": round(proj.result.rmse_px, 3),
+                        "median_px": round(proj.result.median_px, 3),
+                        "adjust_s": round(time.time() - t, 1)})
+            img, _ = proj.preview_mosaic(max_side=1800, blend="disabled")
+            cv2.imwrite(str(proj.out / f"benchmark_{m}.jpg"),
+                        RD.visualise(img.astype(np.float32), proj.vis_channels()),
+                        [cv2.IMWRITE_JPEG_QUALITY, 85])
+        except Exception as exc:  # pragma: no cover - reported, not raised
+            row.update({"aligned_images": 0, "rmse_px": None, "median_px": None, "error": str(exc)})
+        rows.append(row)
+        proj.log(f"  {m}: {row}")
+        for k in [k for k in proj.feats if k[0] == m]:
+            del proj.feats[k]
+    rows.sort(key=lambda r: (-r["aligned_images"], -r["pairs_accepted"],
+                             r["median_px"] if r["median_px"] is not None else 1e9))
+    keys = ["method", "family", "aligned_images", "pairs_accepted", "inliers_median",
+            "inlier_ratio_median", "median_px", "rmse_px", "keypoints_mean",
+            "features_s", "matching_s", "adjust_s"]
+    with open(proj.out / "benchmark.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, keys, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    md = ["# mosaic2d method benchmark", "",
+          f"{len(proj.frames)} images, profile {proj.prof.name}, reference band "
+          f"{proj.ref_band.name if proj.ref_band else 'luminance'}, {len(pairs)} candidate pairs, "
+          f"model {s.model}, accuracy {s.accuracy}.", "",
+          "| " + " | ".join(keys) + " |", "|" + "---|" * len(keys)]
+    for r in rows:
+        md.append("| " + " | ".join(str(r.get(k, "")) for k in keys) + " |")
+    md += ["", f"Ranking: most aligned images, then most accepted pairs, then lowest median "
+               f"reprojection error. Best: **{rows[0]['method']}**."]
+    (proj.out / "benchmark.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    proj.log("benchmark written to " + str(proj.out / "benchmark.md"))
+    return rows
