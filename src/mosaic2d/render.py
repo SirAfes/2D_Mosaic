@@ -91,6 +91,13 @@ class Distortion:
         return self.center + (pts - self.center) * (1 + self.k[0] * r2 + self.k[1] * r2 * r2)
 
 
+def frame_size_px(fr: RenderFrame) -> float:
+    """Typical frame size in output pixels: sqrt of the mapped valid area."""
+    x0, y0, x1, y1 = fr.valid
+    det = abs(np.linalg.det(fr.H[:2, :2] / fr.H[2, 2]))
+    return float(np.sqrt(max(det * (x1 - x0) * (y1 - y0), 1.0)))
+
+
 def footprint(fr: RenderFrame, dist: Distortion, n=12) -> np.ndarray:
     x0, y0, x1, y1 = fr.valid
     t = np.linspace(0, 1, n, endpoint=False)
@@ -195,10 +202,9 @@ class Renderer:
     # ---------------------------------------------------------- low-res pass
     def low_frequency_pass(self):
         """Feather-weighted low-resolution mosaic and per-frame gain fields."""
-        # "low frequency" is relative to the frame size: ~100 cells across a frame
-        sizes = [np.sqrt(max(1, (b[2] - b[0]) * (b[3] - b[1]))) for b in (f.bbox for f in self.frames)]
-        fw = float(np.median(sizes)) if sizes else max(self.W, self.H)
-        ls = min(1.0, 1600.0 / max(self.W, self.H), 100.0 / max(fw, 1.0))
+        # "low frequency" is relative to the frame size: ~70 cells across a frame
+        fw = float(np.median([frame_size_px(f) for f in self.frames])) if self.frames else max(self.W, self.H)
+        ls = min(1.0, 1600.0 / max(self.W, self.H), 70.0 / max(fw, 1.0))
         Wl, Hl = max(1, int(self.W * ls)), max(1, int(self.H * ls))
         acc = np.zeros((Hl, Wl, self.B), np.float64)
         wsum = np.zeros((Hl, Wl), np.float64)

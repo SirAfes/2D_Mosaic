@@ -107,10 +107,30 @@ class SeamMap:
     changed_frac: float = 0.0
 
     def sample(self, X, Y):
-        """Label at output coordinates (nearest)."""
-        xs = np.clip((X * self.scale).astype(np.int64), 0, self.labels.shape[1] - 1)
-        ys = np.clip((Y * self.scale).astype(np.int64), 0, self.labels.shape[0] - 1)
-        return self.labels[ys, xs]
+        """
+        Label at output coordinates. Bilinear "majority": the label whose share of
+        the four surrounding seam-map cells (bilinear weights) is largest. Seam
+        boundaries become smooth at sub-cell level instead of cell-sized stairs.
+        """
+        Hs, Ws = self.labels.shape
+        fx = X * self.scale - 0.5
+        fy = Y * self.scale - 0.5
+        x0 = np.floor(fx).astype(np.int64)
+        y0 = np.floor(fy).astype(np.int64)
+        wx, wy = fx - x0, fy - y0
+        xs = [np.clip(x0, 0, Ws - 1), np.clip(x0 + 1, 0, Ws - 1)]
+        ys = [np.clip(y0, 0, Hs - 1), np.clip(y0 + 1, 0, Hs - 1)]
+        labs = [self.labels[ys[j], xs[i]] for j in (0, 1) for i in (0, 1)]
+        wts = [(1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy]
+        best_lab = labs[0].copy()
+        best_w = np.full(X.shape, -1.0)
+        for a in range(4):
+            tot = sum(np.where(labs[b] == labs[a], wts[b], 0.0) for b in range(4))
+            tot = np.where(labs[a] < 0, -0.5, tot)          # prefer a real frame over "empty"
+            m = tot > best_w
+            best_w[m] = tot[m]
+            best_lab[m] = labs[a][m]
+        return best_lab
 
 
 def voronoi_labels(frames, dist, size, scale, score_fn, map_fn):
@@ -135,18 +155,23 @@ def voronoi_labels(frames, dist, size, scale, score_fn, map_fn):
     return label, (Ws, Hs)
 
 
-def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.25, min_views=3,
-                        tile=512):
+def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.25, weak_frac=None,
+                        halo_px=20, min_views=3, tile=512):
     """
     Per frame, pixels that disagree with the other frames (moving objects).
 
     The per-pixel median over all frames that see a pixel is the consensus
-    (static scene); a frame deviating from it by more than ``rel_thr`` (relative
-    luminance) where at least ``min_views`` frames overlap is an outlier there.
-    Computed tile by tile to keep memory small.
+    (static scene). A frame's relative deviation from it is thresholded with
+    hysteresis: pixels above ``rel_thr`` are certain outliers (the rope itself);
+    optionally (``weak_frac``), pixels above ``weak_frac * rel_thr`` within
+    ``halo_px`` of a certain one are added (out-of-focus halo). Off by default:
+    on textured, relief-rich scenes the weak threshold also catches parallax.
+    Only pixels seen by at least ``min_views`` frames are judged. The median is
+    computed tile by tile to keep memory small.
     """
+    import warnings
     Ws, Hs = size
-    out = [np.zeros(v.shape, bool) for v in valids]
+    dev = [np.zeros(v.shape, np.float32) for v in valids]
     boxes = [(cx, cy, cx + v.shape[1], cy + v.shape[0]) for (cx, cy), v in zip(corners, valids)]
     for ty in range(0, Hs, tile):
         for tx in range(0, Ws, tile):
@@ -158,33 +183,39 @@ def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.
             for n, k in enumerate(ks):
                 cx, cy, ex, ey = boxes[k]
                 x0, y0, x1, y1 = max(tx, cx), max(ty, cy), min(tx1, ex), min(ty1, ey)
-                if x1 <= x0 or y1 <= y0:
-                    continue
                 part = lum[k][y0 - cy:y1 - cy, x0 - cx:x1 - cx]
                 vm = valids[k][y0 - cy:y1 - cy, x0 - cx:x1 - cx]
                 stack[n, y0 - ty:y1 - ty, x0 - tx:x1 - tx] = np.where(vm, part, np.nan)
-            import warnings
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 med = np.nanmedian(stack, axis=0)
+                ref = np.nanmax(med) if np.isfinite(med).any() else 1.0
             views = np.isfinite(stack).sum(0)
             for n, k in enumerate(ks):
                 cx, cy, ex, ey = boxes[k]
                 x0, y0, x1, y1 = max(tx, cx), max(ty, cy), min(tx1, ex), min(ty1, ey)
-                if x1 <= x0 or y1 <= y0:
-                    continue
                 sl = (slice(y0 - ty, y1 - ty), slice(x0 - tx, x1 - tx))
-                dev = np.abs(stack[n][sl] - med[sl]) / (med[sl] + 0.05 * np.nanmax(med) + 1e-6)
-                bad = (dev > rel_thr) & (views[sl] >= min_views)
-                out[k][y0 - cy:y1 - cy, x0 - cx:x1 - cx] |= np.nan_to_num(bad).astype(bool)
-    # remove speckle, then grow a little so whole objects (and their halo) are excluded
+                d = np.abs(stack[n][sl] - med[sl]) / (med[sl] + 0.05 * ref + 1e-6)
+                d = np.where(views[sl] >= min_views, np.nan_to_num(d), 0.0)
+                dev[k][y0 - cy:y1 - cy, x0 - cx:x1 - cx] = d
     k3 = np.ones((3, 3), np.uint8)
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    return [cv2.dilate(cv2.morphologyEx(o.astype(np.uint8), cv2.MORPH_OPEN, k3), k7) > 0 for o in out]
+    kh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * halo_px + 1, 2 * halo_px + 1))
+    out = []
+    for d in dev:
+        strong = cv2.morphologyEx((d > rel_thr).astype(np.uint8), cv2.MORPH_OPEN, k3)
+        if not strong.any():
+            out.append(np.zeros(d.shape, bool))
+            continue
+        core = strong > 0
+        if weak_frac:                                     # optional halo around a core
+            core |= (cv2.dilate(strong, kh) > 0) & (d > rel_thr * weak_frac)
+        out.append(cv2.dilate(core.astype(np.uint8), k7) > 0)
+    return out
 
 
 def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=None,
-                   max_side=2500, band_px=40, deghost=True, log=print) -> SeamMap:
+                   max_side=4000, frame_px=370, band_px=40, deghost=True, log=print) -> SeamMap:
     """
     frames : RenderFrame list (bbox set, output coordinates)
     images : frame index -> (h x w x 3 float32 image in reference-lens px * img_scale, img_scale)
@@ -193,9 +224,11 @@ def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=N
              other frames (moving objects), as long as another frame covers them
     """
     W, H = size
-    img_scale = min(s for _, s in images.values()) if images else 0.1
-    # seam map not finer than the seam images themselves
-    s = min(1.0, max_side / max(W, H), img_scale * 1.5)
+    # Seam-map scale relative to the frame size (sqrt of the frame area ~ frame_px), so that
+    # seams and moving-object detection behave the same at any output resolution.
+    from .render import frame_size_px
+    fw = float(np.median([frame_size_px(f) for f in frames])) if frames else max(W, H)
+    s = min(1.0, max_side / max(W, H), frame_px / max(fw, 1.0))
     label, (Ws, Hs) = voronoi_labels(frames, dist, size, s, score_fn, map_fn)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_px + 1, 2 * band_px + 1))
 
