@@ -282,7 +282,7 @@ class Project:
         fr.thumb = np.clip(np.dstack(chans), 0, 65535).astype(np.uint16)
         fr.thumb_scale = ts
         # medium-resolution visual image for seamline optimisation
-        ss = min(1.0, 1200.0 / max(w, h))
+        ss = min(1.0, 600.0 / max(w, h))   # seam map uses ~370 px per frame
         sw, sh = max(1, int(round(w * ss))), max(1, int(round(h * ss)))
         S2 = np.diag([ss, ss, 1.0])
         bands = prof.output_bands()
