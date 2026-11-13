@@ -105,7 +105,7 @@ On an underwater RGB survey (57 × 61 MP Sony ARW) every method aligned all imag
 
 ## Limits
 
-A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax that no planar transform can remove — seams are placed near frame centres to keep it small; for true orthomosaics of rough terrain use SfM software with a dense surface model. Moving objects are removed only where at least three frames see the area and another frame shows it consistently; an object present in most frames stays. The geometry is relative: `--gsd` gives a metric scale but no georeferencing.
+A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax that no planar transform can remove — seams are placed near frame centres to keep it small; for true orthomosaics of rough terrain use SfM software with a dense surface model. Moving objects are removed only where at least three frames see the area and another frame shows it consistently; an object present in most frames stays. Where an object is removed, the replacing frame's own border can become a short, straight seam next to it (no graph cut there), and a faint out-of-focus halo of a rope close to the camera may remain. The geometry is relative: `--gsd` gives a metric scale but no georeferencing.
 
 ## Development
 
