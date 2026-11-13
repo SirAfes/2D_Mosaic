@@ -30,3 +30,14 @@ def test_tiled_vrt(tmp_path):
     txt = vrt.read_text()
     assert txt.count("<SimpleSource>") == 3 * len(list((tmp_path / "m_tiles").glob("*.tif")))
     assert len(list((tmp_path / "m_tiles").glob("*.tif"))) == 9  # 3 x 4 tiles, last column empty
+
+
+def test_metric_scale_tags_and_world_file(tmp_path):
+    a = np.ones((50, 80, 3), np.uint16)
+    p = write_tiff(tmp_path / "s.tif", a, pixel_size=0.0005, origin=(0.0, 0.025))
+    with tifffile.TiffFile(p) as t:
+        tags = t.pages[0].tags
+        assert tags[33550].value[:2] == (0.0005, 0.0005)
+        assert tags[33922].value[3:5] == (0.0, 0.025)
+    tfw = (tmp_path / "s.tfw").read_text().split()
+    assert float(tfw[0]) == 0.0005 and float(tfw[3]) == -0.0005

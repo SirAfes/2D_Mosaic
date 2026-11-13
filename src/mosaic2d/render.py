@@ -147,11 +147,17 @@ def _remap_multi(img, mx, my, interp=cv2.INTER_LINEAR, border=cv2.BORDER_CONSTAN
     return np.concatenate(parts, axis=2)
 
 
+def cleanup(renderer) -> None:
+    """Remove the renderer's private temporary folder (canvas and accumulators)."""
+    import shutil
+    shutil.rmtree(renderer.work_dir, ignore_errors=True)
+
+
 class Renderer:
     def __init__(self, frames: list[RenderFrame], dist: Distortion, canvas_size: tuple,
                  band_sources: list, n_bands: int, dtype=np.uint16, blend="mosaic",
                  work_dir=None, strip=512, log=print, progress=None, flat=None,
-                 seams="graphcut", vis_bands=(0, 1, 2)):
+                 seams="graphcut", vis_bands=(0, 1, 2), deghost=True):
         """
         band_sources: per output band (lens, channel).
         flat: optional flat field, h_t x w_t x B (thumbnail geometry, reference-lens px * thumb_scale)
@@ -159,6 +165,7 @@ class Renderer:
         """
         self.flat = flat
         self.seam_mode = seams
+        self.deghost = deghost
         self.vis_bands = tuple(vis_bands)
         self.seams = None
         self.frames = frames
@@ -171,8 +178,12 @@ class Renderer:
         self.strip = strip
         self.log = log
         self.progress = progress
-        self.work_dir = Path(work_dir or tempfile.mkdtemp(prefix="mosaic2d_"))
+        # private sub-folder: runs sharing a work dir must never share temporary files
+        import uuid
+        base = Path(work_dir) if work_dir else Path(tempfile.gettempdir())
+        self.work_dir = base / f"mosaic2d_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.canvas_path = None
         for fr in frames:
             fp = footprint(fr, dist)
             x0, y0 = np.floor(fp.min(0)).astype(int)
@@ -184,7 +195,10 @@ class Renderer:
     # ---------------------------------------------------------- low-res pass
     def low_frequency_pass(self):
         """Feather-weighted low-resolution mosaic and per-frame gain fields."""
-        ls = min(1.0, 1600.0 / max(self.W, self.H))
+        # "low frequency" is relative to the frame size: ~100 cells across a frame
+        sizes = [np.sqrt(max(1, (b[2] - b[0]) * (b[3] - b[1]))) for b in (f.bbox for f in self.frames)]
+        fw = float(np.median(sizes)) if sizes else max(self.W, self.H)
+        ls = min(1.0, 1600.0 / max(self.W, self.H), 100.0 / max(fw, 1.0))
         Wl, Hl = max(1, int(self.W * ls)), max(1, int(self.H * ls))
         acc = np.zeros((Hl, Wl, self.B), np.float64)
         wsum = np.zeros((Hl, Wl), np.float64)
@@ -263,7 +277,8 @@ class Renderer:
                     g = self._gain_at(fr, X, Y)
                     return g[..., vb] if g.shape[2] > max(vb) else g
                 self.seams = optimise_seams(self.frames, self.dist, (self.W, self.H), imgs,
-                                            _score, _map, gain_fn, log=self.log)
+                                            _score, _map, gain_fn, deghost=self.deghost,
+                                            log=self.log)
 
     def _gain_at(self, fr, X, Y):
         bx0, by0, ls, g = self.gain[fr.index]
@@ -329,6 +344,7 @@ class Renderer:
         self.log(f"  canvas {self.W} x {self.H} px, {self.B} band(s), "
                  f"{need / 1e9:.2f} GB ({self.blend} blending)")
         canvas_path = self.work_dir / f"{out_name}.canvas"
+        self.canvas_path = canvas_path
         out = np.memmap(canvas_path, dtype=self.dtype, mode="w+", shape=shape)
         acc = wsum = None
         if self.blend == "average":

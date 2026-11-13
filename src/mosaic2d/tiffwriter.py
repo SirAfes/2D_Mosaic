@@ -24,6 +24,7 @@ _NEW_SUBFILE, _W, _H, _BPS, _COMP, _PHOTO, _DESC, _OFFS, _SPP, _RPS, _COUNTS = \
     254, 256, 257, 258, 259, 262, 270, 273, 277, 278, 279
 _PLANAR, _PRED, _SOFTWARE, _EXTRA, _SFMT = 284, 317, 305, 338, 339
 _GDAL_META, _GDAL_NODATA = 42112, 42113
+_PIXEL_SCALE, _TIEPOINT, _GEOKEYS = 33550, 33922, 34735
 
 
 def _gdal_metadata(band_names, wavelengths, extra):
@@ -40,7 +41,13 @@ def _gdal_metadata(band_names, wavelengths, extra):
 
 
 def write_tiff(path, arr, band_names=None, wavelengths=None, nodata=None, description="",
-               metadata=None, rows_per_strip=64, level=6, bigtiff=None, progress=None):
+               metadata=None, rows_per_strip=64, level=6, bigtiff=None, progress=None,
+               pixel_size=None, origin=(0.0, 0.0)):
+    """
+    pixel_size: metres per pixel -> GeoTIFF scale/tie-point tags in a local
+    (non-georeferenced) metric frame, plus a world file (.tfw). origin is the
+    model coordinate of the top-left corner (x right, y up).
+    """
     path = Path(path)
     H, W = arr.shape[:2]
     C = arr.shape[2] if arr.ndim == 3 else 1
@@ -105,10 +112,17 @@ def write_tiff(path, arr, band_names=None, wavelengths=None, nodata=None, descri
             entries.append((_EXTRA, SHORT, [0] * n_extra))
         if nodata is not None:
             entries.append((_GDAL_NODATA, ASCII, str(nodata)))
+        if pixel_size:
+            DOUBLE = 12
+            entries.append((_PIXEL_SCALE, DOUBLE, [float(pixel_size), float(pixel_size), 0.0]))
+            entries.append((_TIEPOINT, DOUBLE, [0.0, 0.0, 0.0, float(origin[0]), float(origin[1]), 0.0]))
+            # GeoKeyDirectory: version 1.1.0, 2 keys; model type user-defined (local
+            # engineering frame), raster type PixelIsArea
+            entries.append((_GEOKEYS, SHORT, [1, 1, 0, 2, 1024, 0, 1, 32767, 1025, 0, 1, 1]))
         entries.sort(key=lambda e: e[0])
 
         inline_bytes = 8 if bigtiff else 4
-        fmt_of = {SHORT: "H", LONG: "I", LONG8: "Q"}
+        fmt_of = {SHORT: "H", LONG: "I", LONG8: "Q", 12: "d"}
         encoded = []
         for tag, typ, val in entries:
             if typ == ASCII:
@@ -138,7 +152,16 @@ def write_tiff(path, arr, band_names=None, wavelengths=None, nodata=None, descri
         fh.write(struct.pack(E + ("Q" if bigtiff else "I"), 0))
         fh.seek(ifd_ptr_pos)
         fh.write(struct.pack(E + ("Q" if bigtiff else "I"), ifd_pos))
+    if pixel_size:
+        write_world_file(path.with_suffix(".tfw"), pixel_size, origin)
     return path
+
+
+def write_world_file(path, pixel_size, origin):
+    """ESRI world file: pixel size, rotation terms, centre of the top-left pixel."""
+    ps = float(pixel_size)
+    Path(path).write_text("\n".join(f"{v:.10f}" for v in
+                                     (ps, 0.0, 0.0, -ps, origin[0] + ps / 2, origin[1] - ps / 2)) + "\n")
 
 
 def band_names_is_ms(names) -> bool:
@@ -146,7 +169,7 @@ def band_names_is_ms(names) -> bool:
 
 
 def write_tiled(out_dir, name, arr, band_names=None, wavelengths=None, nodata=0, tile=16384,
-                metadata=None, log=None):
+                metadata=None, log=None, pixel_size=None):
     """
     Write a large H x W x C array as tiles <name>_tiles/<name>_rRR_cCC.tif plus a
     GDAL VRT (<name>.vrt) that presents them as one raster. Empty tiles are skipped.
@@ -164,13 +187,17 @@ def write_tiled(out_dir, name, arr, band_names=None, wavelengths=None, nodata=0,
             if not np.asarray(blk[::16, ::16]).any() and not np.asarray(blk).any():
                 continue
             fn = f"{name}_r{r:02d}_c{c:02d}.tif"
-            write_tiff(tdir / fn, blk, band_names, wavelengths, nodata, metadata=metadata)
+            org = (x * pixel_size, (H - y) * pixel_size) if pixel_size else (0.0, 0.0)
+            write_tiff(tdir / fn, blk, band_names, wavelengths, nodata, metadata=metadata,
+                       pixel_size=pixel_size, origin=org)
             sources.append((fn, x, y, blk.shape[1], blk.shape[0]))
             if log:
                 log(f"  tile {fn} ({blk.shape[1]} x {blk.shape[0]})")
     rgb = C == 3 and not band_names_is_ms(band_names)
     interp = ["Red", "Green", "Blue"] if rgb else ["Gray"] * C
     lines = [f'<VRTDataset rasterXSize="{W}" rasterYSize="{H}">']
+    if pixel_size:
+        lines.append(f"  <GeoTransform>0, {pixel_size!r}, 0, {H * pixel_size!r}, 0, {-pixel_size!r}</GeoTransform>")
     for b in range(C):
         lines.append(f'  <VRTRasterBand dataType="{dt}" band="{b + 1}">')
         if band_names:

@@ -66,3 +66,29 @@ def test_flatfield_recovers_vignetting():
     ratio = flat[2, 2, 0] / flat[h // 2, w // 2, 0]
     true = vign[2, 2] / vign[h // 2, w // 2]
     assert abs(ratio - true) < 0.08, (ratio, true)
+
+
+def test_deghost_removes_object_seen_in_one_frame_only(tmp_path):
+    world = _texture(900, 400, seed=7).astype(np.float32)
+    frames, imgs = [], {}
+    for k, x in enumerate((0, 150, 300)):
+        img = world[:, x:x + 600].copy()
+        if k == 1:
+            img[60:340, 440 - x:460 - x] = 1500           # dark 'moving' object, only in the middle frame
+        H = np.array([[1, 0, x], [0, 1, 0], [0, 0, 1]], np.float64)
+        frames.append(RD.RenderFrame(k, "", H, (600, 400), (0, 0, 600, 400), {1: np.eye(3)},
+                                     thumb=cv2.resize(img, (150, 100), interpolation=cv2.INTER_AREA).astype(np.uint16),
+                                     thumb_scale=0.25, seam_img=img.astype(np.uint16), seam_scale=1.0))
+        imgs[k] = img.astype(np.uint16)
+    dist = RD.Distortion(np.zeros(2), np.array([300.0, 200.0]), 360.0)
+
+    def render(deghost):
+        rr = RD.Renderer(frames, dist, (900, 400), [(1, 0), (1, 1), (1, 2)], 3, np.uint16,
+                         blend="disabled", work_dir=tmp_path / str(deghost), log=lambda *a: None,
+                         seams="graphcut", deghost=deghost, strip=128)
+        return np.array(rr.render(lambda fr: {1: imgs[fr.index]}))
+    bar = (slice(60, 340), slice(440, 460))
+    assert (render(False)[bar][..., 0] < 1600).mean() > 0.9      # middle frame wins without deghosting
+    out = render(True)
+    assert (out[bar][..., 0] < 1600).mean() < 0.05
+    assert (out[..., 0] > 0).mean() > 0.99

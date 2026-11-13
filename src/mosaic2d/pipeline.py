@@ -73,6 +73,8 @@ class Settings:
     tile_size: int = 0               # >0: write tiles of this size + a VRT instead of one TIFF
     seams: str = "graphcut"          # graphcut (optimised seamlines) | voronoi (closest centre)
     cache: bool = True               # reuse decoded/prepared frames between runs (<out>/_cache)
+    deghost: bool = True             # keep moving objects (rope, fish) out of the mosaic where possible
+    gsd: float | None = None         # metres per pixel at resolution 1.0 (scale only, not georeferencing)
     flatfield: str = "auto"          # auto (estimate vignetting from the series) | none
     ratio: float = 0.8
     ransac_px: float = 3.0
@@ -782,11 +784,7 @@ class Project:
         canvas = rr.render(lambda fr: {0: thumbs[fr.index]}, out_name="preview")
         img = np.array(canvas)
         del canvas
-        try:
-            os.remove(rr.work_dir / "preview.canvas")
-            rr.work_dir.rmdir()
-        except OSError:
-            pass
+        RD.cleanup(rr)
         return img, rr
 
     def vis_channels(self):
@@ -816,6 +814,7 @@ class Project:
         rr = RD.Renderer(frames, dist, (W, H), self.band_sources(), len(bands), dtype,
                          blend=self.s.blend, work_dir=work / "_tmp_canvas", log=self.log,
                          flat=getattr(self, "flat", None), seams=self.s.seams,
+                         deghost=self.s.deghost,
                          vis_bands=self.vis_channels(),
                          progress=lambda k, n: (k % 5 == 0 or k == n) and self.log(f"  rendered {k}/{n} frames"))
         prof = self.prof
@@ -829,29 +828,31 @@ class Project:
                 "REFERENCE_BAND": self.ref_band.name if self.ref_band else "luminance"}
         names_ = [b.name for b in bands]
         wls = [b.wavelength_nm for b in bands]
+        ps = (self.s.gsd / self.s.resolution) if getattr(self.s, "gsd", None) else None
+        if ps:
+            meta["PIXEL_SIZE_M"] = ps
+            self.log(f"  output pixel size {ps * 1000:.3f} mm ({W * ps:.2f} x {H * ps:.2f} m)")
         if self.s.tile_size and max(W, H) > self.s.tile_size:
-            tif = write_tiled(self.out, name, canvas, names_, wls, 0, self.s.tile_size, meta, self.log)
+            tif = write_tiled(self.out, name, canvas, names_, wls, 0, self.s.tile_size, meta, self.log,
+                              pixel_size=ps)
             self.log(f"  wrote {tif.name} + tiles")
         else:
             tif = self.out / f"{name}.tif"
             self.log(f"  writing {tif.name}")
             write_tiff(tif, canvas, band_names=names_, wavelengths=wls, nodata=0,
                        description=json.dumps({"mosaic2d": __version__, "images": len(frames)}),
-                       metadata=meta)
+                       metadata=meta, pixel_size=ps, origin=(0.0, H * ps if ps else 0.0))
         small = RD.downsample(canvas, 3000)
         cv2.imwrite(str(self.out / f"{name}_preview.jpg"), RD.visualise(small, self.vis_channels()),
                     [cv2.IMWRITE_JPEG_QUALITY, 90])
         label, s = rr.seam_map(1600)
         self._save_seams(label, small, self.out / f"{name}_seams.jpg")
         np.save(self.out / f"{name}_transforms.npy", {fr.index: fr.H for fr in frames}, allow_pickle=True)
-        canvas_path = rr.work_dir / f"{name}.canvas"
         del canvas
         if not self.s.keep_canvas:
-            try:
-                os.remove(canvas_path)
-                rr.work_dir.rmdir()
-            except OSError:
-                pass
+            RD.cleanup(rr)
+        else:
+            self.log(f"  canvas kept: {rr.canvas_path}")
         self.seam_changed = None if rr.seams is None else round(rr.seams.changed_frac, 4)
         self.timing["render_s"] = time.time() - t
         self.canvas_size = (W, H)

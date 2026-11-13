@@ -60,6 +60,8 @@ def build_parser():
     r.add_argument("--blend", default="mosaic", choices=["mosaic", "average", "disabled"])
     r.add_argument("--seams", default="graphcut", choices=["graphcut", "voronoi"],
                    help="graphcut: move seams away from moving objects and parallax; voronoi: closest centre")
+    r.add_argument("--no-deghost", dest="deghost", action="store_false",
+                   help="keep moving objects (rope, fish) instead of taking those areas from consistent frames")
     r.add_argument("--flatfield", default="auto", choices=["auto", "none"],
                    help="estimate and remove vignetting / fixed illumination pattern from the series")
     r.add_argument("--resolution", type=float, default=1.0,
@@ -67,6 +69,9 @@ def build_parser():
                         "(0.5 = half resolution)")
     r.add_argument("--orient", default="pca", choices=["pca", "anchor"])
     r.add_argument("--name", default="mosaic")
+    r.add_argument("--gsd", type=float, default=None,
+                   help="metres per pixel at --resolution 1 (e.g. from a scale bar); writes GeoTIFF "
+                        "scale tags and a .tfw so GIS measurements are in metres")
     r.add_argument("--no-render", action="store_true", help="align only; write a preview from thumbnails")
     r.add_argument("--keep-canvas", action="store_true")
     r.add_argument("--tiles", type=int, default=0, dest="tile_size",
@@ -79,6 +84,8 @@ def build_parser():
     rr.add_argument("--orient", default=None, choices=["pca", "anchor"])
     rr.add_argument("--tiles", type=int, default=None, dest="tile_size")
     rr.add_argument("--seams", default=None, choices=["graphcut", "voronoi"])
+    rr.add_argument("--gsd", type=float, default=None)
+    rr.add_argument("--no-deghost", dest="deghost", action="store_const", const=False, default=None)
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
@@ -98,7 +105,7 @@ def main(argv=None):
         from .pipeline import Project
         proj = Project.load(args.project, args.out, blend=args.blend, resolution=args.resolution,
                             orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir,
-                            seams=args.seams)
+                            seams=args.seams, deghost=args.deghost, gsd=args.gsd)
         proj.render(args.name)
         proj.report(args.name)
         return 0
