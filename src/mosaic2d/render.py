@@ -51,6 +51,8 @@ class RenderFrame:
     thumb: np.ndarray | None = None   # h_t x w_t x B (in ref px * thumb_scale)
     thumb_scale: float = 1.0
     penalty: float = 1.0          # seam score multiplier (>1 = blurrier than its neighbours)
+    seam_img: np.ndarray | None = None   # h x w x 3 image for seamline optimisation (ref px * seam_scale)
+    seam_scale: float = 0.0
     Hinv: np.ndarray = field(default=None)
     bbox: tuple = (0, 0, 0, 0)    # x0, y0, x1, y1 in output px
 
@@ -132,15 +134,15 @@ def _cheb_weight(fr, ud, vd):
     return np.clip(1 - d, 0, 1) ** 1.5
 
 
-def _remap_multi(img, mx, my, interp=cv2.INTER_LINEAR):
+def _remap_multi(img, mx, my, interp=cv2.INTER_LINEAR, border=cv2.BORDER_CONSTANT):
     """cv2.remap for any channel count (OpenCV handles at most 4 at once)."""
     if img.ndim == 2:
-        return cv2.remap(img, mx, my, interp, borderMode=cv2.BORDER_CONSTANT, borderValue=0)[..., None]
+        return cv2.remap(img, mx, my, interp, borderMode=border, borderValue=0)[..., None]
     C = img.shape[2]
     parts = []
     for c0 in range(0, C, 4):
         sub = np.ascontiguousarray(img[..., c0:c0 + 4])
-        r = cv2.remap(sub, mx, my, interp, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        r = cv2.remap(sub, mx, my, interp, borderMode=border, borderValue=0)
         parts.append(r if r.ndim == 3 else r[..., None])
     return np.concatenate(parts, axis=2)
 
@@ -148,10 +150,17 @@ def _remap_multi(img, mx, my, interp=cv2.INTER_LINEAR):
 class Renderer:
     def __init__(self, frames: list[RenderFrame], dist: Distortion, canvas_size: tuple,
                  band_sources: list, n_bands: int, dtype=np.uint16, blend="mosaic",
-                 work_dir=None, strip=512, log=print, progress=None):
+                 work_dir=None, strip=512, log=print, progress=None, flat=None,
+                 seams="graphcut", vis_bands=(0, 1, 2)):
         """
         band_sources: per output band (lens, channel).
+        flat: optional flat field, h_t x w_t x B (thumbnail geometry, reference-lens px * thumb_scale)
+        seams: "graphcut" (optimised seamlines) or "voronoi" (closest frame centre)
         """
+        self.flat = flat
+        self.seam_mode = seams
+        self.vis_bands = tuple(vis_bands)
+        self.seams = None
         self.frames = frames
         self.dist = dist
         self.W, self.H = canvas_size
@@ -194,7 +203,7 @@ class Renderer:
             w = _cheb_weight(fr, ud, vd) * valid
             mx = (ud * fr.thumb_scale).astype(np.float32)
             my = (vd * fr.thumb_scale).astype(np.float32)
-            t = _remap_multi(fr.thumb.astype(np.float32), mx, my)
+            t = _remap_multi(self._flat_thumb(fr), mx, my)
             t = np.where(valid[..., None], t, 0)
             acc[by0:by1, bx0:bx1] += t * w[..., None]
             wsum[by0:by1, bx0:bx1] += w
@@ -217,6 +226,44 @@ class Renderer:
             g = cv2.GaussianBlur(g, (0, 0), 1.0).reshape(h, w, -1)
             self.gain[fr.index] = (bx0, by0, ls, g)
         self.low_mosaic = L
+
+    def _flat_thumb(self, fr):
+        t = fr.thumb.astype(np.float32)
+        if self.flat is not None and self.flat.shape[:2] == t.shape[:2]:
+            t = t / self.flat
+        return t
+
+    def _flat_at(self, fr, ud, vd):
+        """Flat field at distorted reference-lens coordinates (h x w x B)."""
+        ts = fr.thumb_scale
+        return _remap_multi(self.flat, (ud * ts).astype(np.float32), (vd * ts).astype(np.float32),
+                            cv2.INTER_LINEAR, cv2.BORDER_REPLICATE)
+
+    def prepare(self):
+        """Low-frequency gains (always: also used to compare frames for seams) and seamlines."""
+        if any(fr.thumb is not None for fr in self.frames):
+            self.low_frequency_pass()
+        if self.seam_mode == "graphcut":
+            imgs = {}
+            for fr in self.frames:
+                if fr.seam_img is not None:
+                    img = fr.seam_img.astype(np.float32)
+                    if self.flat is not None:
+                        fv = self.flat[..., [b for b in self.vis_bands if b < self.flat.shape[2]]]
+                        fl = cv2.resize(fv, img.shape[1::-1], interpolation=cv2.INTER_LINEAR)
+                        img = img / np.maximum(fl.reshape(img.shape[0], img.shape[1], -1), 0.05)
+                    imgs[fr.index] = (img, fr.seam_scale)
+            if len(imgs) >= 2:
+                from .seams import optimise_seams
+                vb = list(self.vis_bands)
+
+                def gain_fn(fr, X, Y):
+                    if fr.index not in self.gain:
+                        return np.ones(X.shape + (3,), np.float32)
+                    g = self._gain_at(fr, X, Y)
+                    return g[..., vb] if g.shape[2] > max(vb) else g
+                self.seams = optimise_seams(self.frames, self.dist, (self.W, self.H), imgs,
+                                            _score, _map, gain_fn, log=self.log)
 
     def _gain_at(self, fr, X, Y):
         bx0, by0, ls, g = self.gain[fr.index]
@@ -251,10 +298,25 @@ class Renderer:
         uc, vc = _map(fr, Xc, Yc)
         sc, _, _, _ = _score(fr, uc, vc, self.dist)
         lose = np.zeros(Xc.shape, bool)
-        for g in cand:
-            ug, vg = _map(g, Xc, Yc)
-            sg, vgm, _, _ = _score(g, ug, vg, self.dist)
-            lose |= vgm & ((sg < sc) | ((sg == sc) & (g.index < fr.index)))
+        if self.seams is not None:
+            # optimised seamlines decide, as long as the chosen frame really covers the pixel
+            lab = self.seams.sample(Xc, Yc)
+            decided = lab == fr.index
+            for g in cand:
+                m = lab == g.index
+                if m.any():
+                    ug, vg = _map(g, Xc, Yc)
+                    _, vgm, _, _ = _score(g, ug, vg, self.dist)
+                    lose |= m & vgm
+                    decided |= m & vgm
+            open_ = ~decided
+        else:
+            open_ = np.ones(Xc.shape, bool)
+        if open_.any():
+            for g in cand:
+                ug, vg = _map(g, Xc, Yc)
+                sg, vgm, _, _ = _score(g, ug, vg, self.dist)
+                lose |= open_ & vgm & ((sg < sc) | ((sg == sc) & (g.index < fr.index)))
         if not lose.any():
             return np.zeros((h, w), bool)
         lose = cv2.erode(lose.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
@@ -272,8 +334,8 @@ class Renderer:
         if self.blend == "average":
             acc = np.memmap(self.work_dir / "acc.f32", np.float32, "w+", shape)
             wsum = np.memmap(self.work_dir / "wsum.f32", np.float32, "w+", shape[:2])
-        if self.blend == "mosaic":
-            self.low_frequency_pass()
+        if not self.gain and self.seams is None:
+            self.prepare()
 
         for n, fr in enumerate(self.frames):
             x0, y0, x1, y1 = fr.bbox
@@ -314,7 +376,9 @@ class Renderer:
                     r = _remap_multi(np.ascontiguousarray(sub), mx, my)
                     vals[..., bands] = r
                 Xc, Yc = X[r0:r1, c0:c1], Y[r0:r1, c0:c1]
-                if self.blend == "mosaic" and fr.index in self.gain:
+                if self.flat is not None:
+                    vals /= np.maximum(self._flat_at(fr, udc, vdc), 0.05)
+                if self.blend == "mosaic" and fr.index in self.gain:  # two-band blending
                     vals *= self._gain_at(fr, Xc, Yc)
                 oy, ox = ys + r0, x0 + c0
                 if self.blend == "average":
@@ -350,6 +414,8 @@ class Renderer:
         s = min(1.0, max_side / max(self.W, self.H))
         Wp, Hp = max(1, int(self.W * s)), max(1, int(self.H * s))
         X, Y = np.meshgrid((np.arange(Wp) + 0.5) / s, (np.arange(Hp) + 0.5) / s)
+        if self.seams is not None:
+            return self.seams.sample(X, Y).astype(np.int32), s
         best = np.full((Hp, Wp), np.inf)
         label = np.full((Hp, Wp), -1, np.int32)
         for fr in self.frames:

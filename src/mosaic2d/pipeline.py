@@ -71,6 +71,9 @@ class Settings:
     work_dir: str | None = None
     keep_canvas: bool = False
     tile_size: int = 0               # >0: write tiles of this size + a VRT instead of one TIFF
+    seams: str = "graphcut"          # graphcut (optimised seamlines) | voronoi (closest centre)
+    cache: bool = True               # reuse decoded/prepared frames between runs (<out>/_cache)
+    flatfield: str = "auto"          # auto (estimate vignetting from the series) | none
     ratio: float = 0.8
     ransac_px: float = 3.0
     min_inliers: int = 25
@@ -93,6 +96,8 @@ class Frame:
     valid: tuple = (0, 0, 0, 0)
     thumb: np.ndarray | None = None
     thumb_scale: float = 1.0
+    seam_img: np.ndarray | None = None  # visual bands, reference-lens px * seam_scale (uint16)
+    seam_scale: float = 0.0
     sharpness: float = 0.0            # Laplacian energy of the working image
     quality: float = 1.0              # sharpness relative to the series median
 
@@ -274,28 +279,137 @@ class Project:
             chans.append(cv2.warpPerspective(small, M, (tw, th), flags=cv2.INTER_LINEAR))
         fr.thumb = np.clip(np.dstack(chans), 0, 65535).astype(np.uint16)
         fr.thumb_scale = ts
+        # medium-resolution visual image for seamline optimisation
+        ss = min(1.0, 1200.0 / max(w, h))
+        sw, sh = max(1, int(round(w * ss))), max(1, int(round(h * ss)))
+        S2 = np.diag([ss, ss, 1.0])
+        bands = prof.output_bands()
+        vis = []
+        for k in self.vis_channels():
+            b = bands[k]
+            img = SR.band_image(fd, b).astype(np.float32)
+            lh, lw = img.shape[:2]
+            small = cv2.resize(img, (max(1, int(round(lw * ss))), max(1, int(round(lh * ss)))),
+                               interpolation=cv2.INTER_AREA)
+            A = np.eye(3) if fr.lens is None else fr.lens.A(b.lens)
+            vis.append(cv2.warpPerspective(small, S2 @ A @ np.linalg.inv(S2), (sw, sh),
+                                           flags=cv2.INTER_LINEAR))
+        fr.seam_img = np.clip(np.dstack(vis), 0, 65535).astype(np.uint16)
+        fr.seam_scale = ss
+
+    # ------------------------------------------------------------------ cache
+    def _cache_dir(self) -> Path:
+        return Path(self.s.work_dir or self.out) / "_cache"
+
+    def _cache_key(self, path: Path, extra="") -> str:
+        """Depends on the file (name, size, time) and every setting that changes ingest."""
+        import hashlib
+        st = path.stat()
+        parts = [__version__.rsplit(".", 1)[0], path.name, st.st_size, int(st.st_mtime), self.prof.name,
+                 self.s.demosaic, self.s.accuracy, self.s.lens_affine,
+                 self.ref_band.name if self.ref_band else "lum", extra]
+        return hashlib.sha1(repr(parts).encode()).hexdigest()[:20]
+
+    def _cache_load(self, key):
+        import pickle
+        f = self._cache_dir() / f"{key}.pkl"
+        if not (self.s.cache and f.is_file()):
+            return None
+        try:
+            with open(f, "rb") as fh:
+                return pickle.load(fh)
+        except Exception:
+            return None
+
+    def _cache_save(self, key, obj):
+        import pickle
+        if not self.s.cache:
+            return
+        d = self._cache_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f"{key}.tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump(obj, fh, protocol=4)
+        os.replace(tmp, d / f"{key}.pkl")
+
+    def _cached_reference_band(self):
+        """Reference band selection is expensive for multispectral series: cache it."""
+        trivial = len(self.prof.bands) == 1 or (not self.prof.multilens and self.prof.name == "rgb")
+        if not self.s.cache or self.s.ref_band or trivial:
+            self._select_reference_band()
+            return
+        import hashlib
+        key = "refband_" + hashlib.sha1(repr([self.prof.name, self.methods[0], self.s.accuracy] + [
+            (f.name, f.stat().st_size) for f in self.files]).encode()).hexdigest()[:16]
+        hit = self._cache_load(key)
+        if hit is not None:
+            name, self.band_scores = hit
+            self.ref_band = None if name is None else next(b for b in self.prof.bands if b.name == name)
+            self.log(f"  reference band (cached): {name}")
+            return
+        self._select_reference_band()
+        self._cache_save(key, (self.ref_band.name if self.ref_band else None, self.band_scores))
 
     def ingest(self):
         t = time.time()
         self.log(f"mosaic2d {__version__}: {len(self.files)} images, profile '{self.prof.name}', "
                  f"methods {','.join(self.methods)}, strategy {self.s.strategy}, model {self.s.model}")
-        self._select_reference_band()
+        self._cached_reference_band()
         frames = [None] * len(self.files)
         done = [0]
+        keys = [self._cache_key(f) for f in self.files]
+        hits = 0
 
         def work(i):
+            fr = self._cache_load(keys[i])
+            if fr is not None:
+                fr.index, fr.path = i, self.files[i]
+                return fr, True
             fr = self._ingest_one(i, self.files[i])
             done[0] += 1
-            if done[0] % 10 == 0 or done[0] == len(self.files):
-                self.log(f"  ingested {done[0]}/{len(self.files)}")
-            return fr
+            if done[0] % 10 == 0:
+                self.log(f"  decoded {done[0]} images")
+            return fr, False
         with ThreadPoolExecutor(self.jobs) as ex:
-            for fr in ex.map(work, range(len(self.files))):
+            for fr, hit in ex.map(work, range(len(self.files))):
                 frames[fr.index] = fr
+                hits += hit
         self.frames = frames
-        if self.prof.multilens:
+        if hits:
+            self.log(f"  {hits}/{len(self.files)} images from the cache, {len(self.files) - hits} decoded")
+        if self.prof.multilens and hits < len(self.files):
             self._lens_consensus()
+        for k, fr in enumerate(self.frames):
+            self._cache_save(keys[k], fr)
+        self.estimate_flatfield()
         self.timing["ingest_s"] = time.time() - t
+
+    def estimate_flatfield(self):
+        """Vignetting / fixed illumination pattern from the whole series (seams.py)."""
+        self.flat, self.flat_stats = None, {}
+        if self.s.flatfield == "none":
+            return
+        from .seams import estimate_flatfield
+        thumbs, valids = [], []
+        for fr in self.frames:
+            if fr.thumb is None:
+                continue
+            ts = fr.thumb_scale
+            h, w = fr.thumb.shape[:2]
+            x0, y0, x1, y1 = [v * ts for v in fr.valid]
+            yy, xx = np.mgrid[0:h, 0:w]
+            valids.append((xx >= x0) & (xx < x1) & (yy >= y0) & (yy < y1) & (fr.thumb.min(2) > 0))
+            thumbs.append(fr.thumb)
+        flat, stats = estimate_flatfield(thumbs, valids)
+        if flat is None:
+            self.log(f"  flat field not estimated: {stats}")
+            return
+        bands = self.prof.output_bands()
+        self.flat = flat
+        self.flat_stats = {bands[b].name: v for b, v in stats.items()}
+        worst = min(self.flat_stats.items(), key=lambda kv: kv[1])
+        self.log(f"  flat field: corner/centre brightness {np.mean(list(stats.values())):.2f} on average "
+                 f"(strongest falloff {worst[0]}: {worst[1]:.2f}); corrected in the mosaic")
 
     def _image_quality(self):
         """
@@ -572,6 +686,10 @@ class Project:
             d = pickle.load(fh)
         proj = cls.__new__(cls)
         proj.__dict__.update(d["state"])
+        from dataclasses import fields as _fields
+        for f in _fields(Settings):            # projects saved by older versions
+            if not hasattr(proj.s, f.name):
+                setattr(proj.s, f.name, f.default)
         for k, v in overrides.items():
             if v is not None:
                 setattr(proj.s, k, v)
@@ -626,7 +744,9 @@ class Project:
                 ln: fr.lens.A(ln) for ln in range(1, self.prof.n_lenses + 1)}
             out.append(RD.RenderFrame(fr.index, str(fr.path), T @ r.H[fr.index], fr.ref_size,
                                       fr.valid, A, fr.thumb, fr.thumb_scale,
-                                      penalty=seam_penalty(fr.quality)))
+                                      penalty=seam_penalty(fr.quality),
+                                      seam_img=getattr(fr, "seam_img", None),
+                                      seam_scale=getattr(fr, "seam_scale", 0.0)))
         return out
 
     def band_sources(self):
@@ -655,7 +775,8 @@ class Project:
         dist = RD.Distortion(r.k, r.center * ts0, r.radius * ts0)
         nb = self.frames[0].thumb.shape[2]
         rr = RD.Renderer(frames, dist, (W, H), [(0, b) for b in range(nb)], nb, np.uint16,
-                         blend=blend, strip=4096, log=lambda *a: None,
+                         blend=blend, strip=4096, log=lambda *a: None, seams="voronoi",
+                         flat=getattr(self, "flat", None),
                          work_dir=Path(self.s.work_dir or self.out) / "_tmp_preview")
         thumbs = {fr.index: fr.thumb for fr in frames}
         canvas = rr.render(lambda fr: {0: thumbs[fr.index]}, out_name="preview")
@@ -694,6 +815,8 @@ class Project:
         work = Path(self.s.work_dir or self.out)
         rr = RD.Renderer(frames, dist, (W, H), self.band_sources(), len(bands), dtype,
                          blend=self.s.blend, work_dir=work / "_tmp_canvas", log=self.log,
+                         flat=getattr(self, "flat", None), seams=self.s.seams,
+                         vis_bands=self.vis_channels(),
                          progress=lambda k, n: (k % 5 == 0 or k == n) and self.log(f"  rendered {k}/{n} frames"))
         prof = self.prof
 
@@ -729,6 +852,7 @@ class Project:
                 rr.work_dir.rmdir()
             except OSError:
                 pass
+        self.seam_changed = None if rr.seams is None else round(rr.seams.changed_frac, 4)
         self.timing["render_s"] = time.time() - t
         self.canvas_size = (W, H)
         self.T_out = T
@@ -782,6 +906,10 @@ class Project:
             "distortion_k1_k2": r.k.tolist() if r else None,
             "anchor": self.frames[r.anchor].path.name if r else None,
             "canvas_px": getattr(self, "canvas_size", None),
+            "flat_field_corner_over_centre": getattr(self, "flat_stats", {}),
+            "seams": self.s.seams,
+            "seam_area_moved_by_graphcut": getattr(self, "seam_changed", None),
+            "image_quality": {f.path.name: round(f.quality, 3) for f in self.frames},
             "timing_s": {k: round(v, 1) for k, v in self.timing.items()},
         }
         (self.out / f"{name}_report.json").write_text(json.dumps(rep, indent=2, default=str))

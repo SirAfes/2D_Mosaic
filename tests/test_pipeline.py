@@ -104,3 +104,22 @@ def test_blurred_frame_detected_from_overlaps(tmp_path):
     q = {f.path.name: f.quality for f in proj.frames}
     assert q["IMG_002.tif"] < 0.5, q
     assert all(v > 0.7 for k, v in q.items() if k != "IMG_002.tif"), q
+
+
+def test_ingest_cache_reused(tmp_path):
+    from mosaic2d.pipeline import Project
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=3, n_rows=1)
+    s = Settings(methods="orb", accuracy="high", resolution=0.2, distortion=False, n_features=2000, jobs=2)
+    p1 = Project(src, tmp_path / "out", s)
+    p1.ingest()
+    p2 = Project(src, tmp_path / "out", s)
+    p2.ingest()
+    assert len(list((tmp_path / "out" / "_cache").glob("*.pkl"))) == 3
+    assert all(np.array_equal(a.reg, b.reg) for a, b in zip(p1.frames, p2.frames))
+    # a changed setting that affects ingest must not hit the cache
+    s2 = Settings(methods="orb", accuracy="lowest", resolution=0.2, distortion=False, n_features=2000, jobs=2)
+    p3 = Project(src, tmp_path / "out", s2)
+    p3.ingest()
+    assert p3.frames[0].reg.shape != p1.frames[0].reg.shape

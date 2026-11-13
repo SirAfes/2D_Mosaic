@@ -45,7 +45,9 @@ def _add_common(p: argparse.ArgumentParser):
     p.add_argument("--ratio", type=float, default=0.8)
     p.add_argument("--jobs", type=int, default=0, help="worker threads (default: up to 4)")
     p.add_argument("--max-images", type=int, default=0)
-    p.add_argument("--work-dir", default=None, help="folder for the temporary canvas (needs free space)")
+    p.add_argument("--work-dir", default=None, help="folder for the temporary canvas and the cache")
+    p.add_argument("--no-cache", dest="cache", action="store_false",
+                   help="do not reuse decoded frames from earlier runs (<out>/_cache)")
 
 
 def build_parser():
@@ -56,6 +58,10 @@ def build_parser():
     r = sub.add_parser("run", help="build a mosaic")
     _add_common(r)
     r.add_argument("--blend", default="mosaic", choices=["mosaic", "average", "disabled"])
+    r.add_argument("--seams", default="graphcut", choices=["graphcut", "voronoi"],
+                   help="graphcut: move seams away from moving objects and parallax; voronoi: closest centre")
+    r.add_argument("--flatfield", default="auto", choices=["auto", "none"],
+                   help="estimate and remove vignetting / fixed illumination pattern from the series")
     r.add_argument("--resolution", type=float, default=1.0,
                    help="output pixel size relative to the native pixels of the reference image "
                         "(0.5 = half resolution)")
@@ -72,6 +78,7 @@ def build_parser():
     rr.add_argument("--resolution", type=float, default=None)
     rr.add_argument("--orient", default=None, choices=["pca", "anchor"])
     rr.add_argument("--tiles", type=int, default=None, dest="tile_size")
+    rr.add_argument("--seams", default=None, choices=["graphcut", "voronoi"])
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
@@ -90,7 +97,8 @@ def main(argv=None):
     if args.cmd == "render":
         from .pipeline import Project
         proj = Project.load(args.project, args.out, blend=args.blend, resolution=args.resolution,
-                            orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir)
+                            orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir,
+                            seams=args.seams)
         proj.render(args.name)
         proj.report(args.name)
         return 0
