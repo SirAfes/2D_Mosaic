@@ -154,17 +154,79 @@ def _remap_multi(img, mx, my, interp=cv2.INTER_LINEAR, border=cv2.BORDER_CONSTAN
     return np.concatenate(parts, axis=2)
 
 
+class _SeamAccumulator:
+    """
+    Sparse float accumulator for the narrow feathering band along seamlines.
+    Only tiles the band touches are allocated, so memory stays proportional to
+    the seam length, not to the canvas.
+    """
+
+    def __init__(self, n_bands: int, tile: int = 32):
+        self.B, self.t = n_bands, tile
+        self.tiles: dict = {}
+
+    def add(self, oy: int, ox: int, mask: np.ndarray, vals: np.ndarray, w: np.ndarray):
+        ys, xs = np.nonzero(mask)
+        if ys.size == 0:
+            return
+        gy, gx = ys + oy, xs + ox
+        ty, tx = gy // self.t, gx // self.t
+        key = ty * 10_000_000 + tx
+        order = np.argsort(key, kind="stable")
+        key, ys, xs, gy, gx = key[order], ys[order], xs[order], gy[order], gx[order]
+        cuts = np.flatnonzero(np.diff(key)) + 1
+        for a, b in zip(np.r_[0, cuts], np.r_[cuts, key.size]):
+            k = (int(gy[a] // self.t), int(gx[a] // self.t))
+            if k not in self.tiles:
+                self.tiles[k] = (np.zeros((self.t, self.t, self.B), np.float32),
+                                 np.zeros((self.t, self.t), np.float32))
+            acc, ws = self.tiles[k]
+            ly, lx = gy[a:b] - k[0] * self.t, gx[a:b] - k[1] * self.t
+            ww = w[ys[a:b], xs[a:b]]
+            acc[ly, lx] += vals[ys[a:b], xs[a:b]] * ww[:, None]
+            ws[ly, lx] += ww
+
+    def flush(self, out, maxv, dtype):
+        H, W = out.shape[:2]
+        for (ty, tx), (acc, ws) in self.tiles.items():
+            y0, x0 = ty * self.t, tx * self.t
+            h, w = min(self.t, H - y0), min(self.t, W - x0)
+            m = ws[:h, :w] > 1e-3
+            if not m.any():
+                continue
+            blk = np.array(out[y0:y0 + h, x0:x0 + w])
+            # The frame that owns a pixel outright (weight >= 0.998) wrote it
+            # directly and is not in the accumulator: it gets the weight the
+            # band frames leave over, so a lone minor contribution cannot take
+            # the pixel over.
+            a = acc[:h, :w][m]
+            s = ws[:h, :w][m]
+            cur = blk[m].astype(np.float32)
+            has = cur.max(axis=1) > 0
+            rest = np.where(has, np.maximum(1.0 - s, 0.0), 0.0)
+            v = (a + rest[:, None] * cur) / np.maximum(s + rest, 1e-6)[:, None]
+            blk[m] = np.clip(v, 1, maxv).astype(dtype)
+            out[y0:y0 + h, x0:x0 + w] = blk
+        n = len(self.tiles)
+        self.tiles = {}
+        return n
+
+
 def cleanup(renderer) -> None:
     """Remove the renderer's private temporary folder (canvas and accumulators)."""
     import shutil
     shutil.rmtree(renderer.work_dir, ignore_errors=True)
+    try:                                   # parent folder too, if nothing else uses it
+        Path(renderer.work_dir).parent.rmdir()
+    except OSError:
+        pass
 
 
 class Renderer:
     def __init__(self, frames: list[RenderFrame], dist: Distortion, canvas_size: tuple,
                  band_sources: list, n_bands: int, dtype=np.uint16, blend="mosaic",
                  work_dir=None, strip=512, log=print, progress=None, flat=None,
-                 seams="graphcut", vis_bands=(0, 1, 2), deghost=True):
+                 seams="graphcut", vis_bands=(0, 1, 2), deghost=True, feather=True):
         """
         band_sources: per output band (lens, channel).
         flat: optional flat field, h_t x w_t x B (thumbnail geometry, reference-lens px * thumb_scale)
@@ -173,6 +235,7 @@ class Renderer:
         self.flat = flat
         self.seam_mode = seams
         self.deghost = deghost
+        self.feather = feather
         self.vis_bands = tuple(vis_bands)
         self.seams = None
         self.frames = frames
@@ -229,13 +292,35 @@ class Renderer:
             wsum[by0:by1, bx0:bx1] += w
             own[fr.index] = (bx0, by0, t, valid)
         L = acc / np.maximum(wsum, 1e-9)[..., None]
-        Lb = cv2.GaussianBlur(L.astype(np.float32), (0, 0), sig)
+        # Objects seen by one frame only (a rope or fish close to the camera) must
+        # not enter the gain fields: that frame would be darkened (or brightened)
+        # all around the object, and the step stays after the object is removed.
+        # Cells where a frame's brightness ratio to the consensus departs from
+        # the frame's local ratio are left out of the consensus and of the frame.
+        inl = self._gain_inliers(own, L)
+        acc2 = np.zeros_like(acc)
+        wsum2 = np.zeros_like(wsum)
         for fr in self.frames:
             if fr.index not in own:
                 continue
             bx0, by0, t, valid = own[fr.index]
             h, w = valid.shape
-            vm = valid.astype(np.float32)
+            u, v = _map(fr, *np.meshgrid((np.arange(bx0, bx0 + w) + 0.5) / ls,
+                                         (np.arange(by0, by0 + h) + 0.5) / ls))
+            _, _, ud, vd = _score(fr, u, v, self.dist)
+            wt = _cheb_weight(fr, ud, vd) * inl[fr.index]
+            acc2[by0:by0 + h, bx0:bx0 + w] += t * wt[..., None]
+            wsum2[by0:by0 + h, bx0:bx0 + w] += wt
+        L2 = np.where((wsum2 > 1e-6)[..., None], acc2 / np.maximum(wsum2, 1e-9)[..., None], L)
+        Lb = cv2.GaussianBlur(L2.astype(np.float32), (0, 0), sig)
+        for fr in self.frames:
+            if fr.index not in own:
+                continue
+            bx0, by0, t, valid = own[fr.index]
+            h, w = valid.shape
+            vm = (valid & inl[fr.index]).astype(np.float32)
+            if vm.sum() < 0.2 * max(valid.sum(), 1):
+                vm = valid.astype(np.float32)
             # normalised (masked) blur of the frame's own low-res image
             tb = cv2.GaussianBlur(t.astype(np.float32) * vm[..., None], (0, 0), sig)
             nb = cv2.GaussianBlur(vm, (0, 0), sig)
@@ -246,6 +331,49 @@ class Renderer:
             g = cv2.GaussianBlur(g, (0, 0), 1.0).reshape(h, w, -1)
             self.gain[fr.index] = (bx0, by0, ls, g)
         self.low_mosaic = L
+
+    @staticmethod
+    def _gain_inliers(own, L, thr=0.12, sig=4.0):
+        """Per frame: low-res cells whose brightness agrees with the consensus up
+        to the frame's smooth gain (|log ratio - local ratio| < thr)."""
+        lumL = L.mean(axis=2)
+        Hl, Wl = lumL.shape
+        eps = 0.02 * float(np.median(lumL[lumL > 0])) if (lumL > 0).any() else 1e-6
+        # per-cell median of log brightness over the frames that see the cell
+        # (sparse: memory proportional to the frame footprints, not frames x canvas)
+        cells, vals, logs = [], [], {}
+        for fi, (bx0, by0, t, valid) in own.items():
+            h, w = valid.shape
+            lg = np.log(t.reshape(h, w, -1).mean(axis=2) + eps)
+            logs[fi] = lg
+            yy, xx = np.nonzero(valid)
+            cells.append((yy + by0) * Wl + (xx + bx0))
+            vals.append(lg[yy, xx])
+        med = np.log(lumL + eps)
+        if cells:
+            c = np.concatenate(cells)
+            v = np.concatenate(vals)
+            o = np.lexsort((v, c))
+            c, v = c[o], v[o]
+            starts = np.r_[0, np.flatnonzero(np.diff(c)) + 1]
+            counts = np.diff(np.r_[starts, c.size])
+            ok = counts >= 3                          # with fewer views keep the mean
+            mflat = med.reshape(-1)
+            mflat[c[starts[ok]]] = v[starts[ok] + counts[ok] // 2]
+            med = mflat.reshape(Hl, Wl)
+        out = {}
+        for fi, (bx0, by0, t, valid) in own.items():
+            h, w = valid.shape
+            r = logs[fi] - med[by0:by0 + h, bx0:bx0 + w]
+            m = valid.copy()
+            for _ in range(3):                       # robust local ratio (outliers left out)
+                mf = m.astype(np.float32)
+                ref = (cv2.GaussianBlur((r * mf).astype(np.float32), (0, 0), sig)
+                       / np.maximum(cv2.GaussianBlur(mf, (0, 0), sig), 1e-6))
+                m = valid & (np.abs(r - ref) < thr)
+            bad = cv2.dilate((valid & ~m).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+            out[fi] = valid & ~bad
+        return out
 
     def _flat_thumb(self, fr):
         t = fr.thumb.astype(np.float32)
@@ -358,6 +486,11 @@ class Renderer:
             wsum = np.memmap(self.work_dir / "wsum.f32", np.float32, "w+", shape[:2])
         if not self.gain and self.seams is None:
             self.prepare()
+        # narrow feathering across optimised seamlines (two-band blending only;
+        # 'disabled' keeps every pixel value exactly as in one source frame)
+        feathering = (self.feather and self.blend == "mosaic" and self.seams is not None
+                      and bool(self.seams.soft))
+        seam_acc = _SeamAccumulator(self.B) if feathering else None
 
         for n, fr in enumerate(self.frames):
             x0, y0, x1, y1 = fr.bbox
@@ -378,10 +511,18 @@ class Renderer:
                     sel = valid
                 else:
                     sel = valid & ~self._lose_mask(fr, others, X, Y, x0, x1, ys, ye)
-                if not sel.any():
+                band = None
+                if feathering:
+                    wf = self.seams.weight(fr.index, X, Y)
+                    if wf is not None:
+                        band = valid & (wf > 0.002) & (wf < 0.998)
+                        if not band.any():
+                            band = None
+                region = sel if band is None else (sel | band)
+                if not region.any():
                     continue
-                rows = np.where(sel.any(1))[0]
-                cols = np.where(sel.any(0))[0]
+                rows = np.where(region.any(1))[0]
+                cols = np.where(region.any(0))[0]
                 r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
                 sel = sel[r0:r1, c0:c1]
                 udc, vdc = ud[r0:r1, c0:c1], vd[r0:r1, c0:c1]
@@ -411,9 +552,14 @@ class Renderer:
                     tgt = out[oy:oy + sel.shape[0], ox:ox + sel.shape[1]]
                     v = np.clip(vals, 1, self.maxv).astype(self.dtype)
                     tgt[sel] = v[sel]
+                    if band is not None:
+                        seam_acc.add(oy, ox, band[r0:r1, c0:c1], vals, wf[r0:r1, c0:c1])
             del lenses
             if self.progress:
                 self.progress(n + 1, len(self.frames))
+        if seam_acc is not None:
+            n = seam_acc.flush(out, self.maxv, self.dtype)
+            self.log(f"  seamlines feathered ({n} tiles of 32 px)")
         if self.blend == "average":
             for ys in range(0, self.H, self.strip):
                 w = np.asarray(wsum[ys:ys + self.strip])

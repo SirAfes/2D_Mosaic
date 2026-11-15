@@ -74,6 +74,7 @@ class Settings:
     seams: str = "graphcut"          # graphcut (optimised seamlines) | voronoi (closest centre)
     cache: bool = True               # reuse decoded/prepared frames between runs (<out>/_cache)
     deghost: bool = True             # keep moving objects (rope, fish) out of the mosaic where possible
+    feather: bool = True             # soften seamlines over a narrow band (mosaic blending)
     gsd: float | None = None         # metres per pixel at resolution 1.0 (scale only, not georeferencing)
     flatfield: str = "auto"          # auto (estimate vignetting from the series) | none
     ratio: float = 0.8
@@ -100,42 +101,67 @@ class Frame:
     thumb_scale: float = 1.0
     seam_img: np.ndarray | None = None  # visual bands, reference-lens px * seam_scale (uint16)
     seam_scale: float = 0.0
-    sharpness: float = 0.0            # Laplacian energy of the working image
+    qimg: np.ndarray | None = None    # log-intensity image (half working res, float32) for quality
+    sharpness: float = 0.0            # Laplacian energy of qimg
     quality: float = 1.0              # sharpness relative to the series median
 
 
-def image_sharpness(img_u8: np.ndarray) -> float:
-    """Mean squared Laplacian of the (contrast-normalised) working image, central 80 %."""
+def quality_image(g: np.ndarray) -> np.ndarray:
+    """
+    Image for sharpness / contrast measurements: log intensity at half size.
+
+    No CLAHE or local normalisation (those restore the contrast a veil removes,
+    and amplify noise, so a hazy frame would look *sharper*). In the log domain
+    multiplicative differences (exposure, vignetting) do not change the
+    Laplacian, additive veils (scattered light) and blur reduce it.
+    """
+    g = cv2.resize(g.astype(np.float32), None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    med = float(np.median(g[::4, ::4])) or 1.0
+    return np.log(np.maximum(g, 0) + 0.02 * med + 1e-6).astype(np.float32)
+
+
+def image_sharpness(img: np.ndarray) -> float:
+    """Mean squared Laplacian of an image (quality_image), central 80 %."""
+    img_u8 = img
     h, w = img_u8.shape[:2]
     c = img_u8[h // 10: h - h // 10, w // 10: w - w // 10]
     g = cv2.GaussianBlur(c.astype(np.float32), (0, 0), 1.0)
     return float(cv2.Laplacian(g, cv2.CV_32F).var())
 
 
-def _overlap_log_ratio(a: np.ndarray, b: np.ndarray, H: np.ndarray):
-    """log(sharpness of a / sharpness of b) on their common area (H: a -> b)."""
+def _overlap_log_ratio(a: np.ndarray, b: np.ndarray, H: np.ndarray, s: float = 0.5):
+    """log(sharpness of a / sharpness of b) on their common area (H: a -> b).
+    ``s``: internal down-scaling of a and b (1.0 when they are already small)."""
     def energy(img, mask):
         g = cv2.GaussianBlur(img.astype(np.float32), (0, 0), 1.0)
         lap = cv2.Laplacian(g, cv2.CV_32F)
-        m = cv2.erode(mask, np.ones((9, 9), np.uint8)) > 0
+        m = cv2.erode(mask, np.ones((15, 15), np.uint8)) > 0   # > blur + Laplacian support
         return float((lap[m] ** 2).mean()) if m.sum() > 2000 else None
 
-    s = 0.5
     S = np.diag([s, s, 1.0])
-    a2 = cv2.resize(a, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    b2 = cv2.resize(b, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    a, b = a.astype(np.float32), b.astype(np.float32)
+    a2 = a if s == 1.0 else cv2.resize(a, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    b2 = b if s == 1.0 else cv2.resize(b, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
     Hs = S @ H @ np.linalg.inv(S)
     ones_a = np.full(a2.shape, 255, np.uint8)
     ones_b = np.full(b2.shape, 255, np.uint8)
-    a_in_b = cv2.warpPerspective(a2, Hs, b2.shape[::-1])
+    a_in_b = cv2.warpPerspective(a2, Hs, b2.shape[::-1], borderMode=cv2.BORDER_REPLICATE)
     m_b = cv2.warpPerspective(ones_a, Hs, b2.shape[::-1], flags=cv2.INTER_NEAREST)
-    b_in_a = cv2.warpPerspective(b2, np.linalg.inv(Hs), a2.shape[::-1])
+    b_in_a = cv2.warpPerspective(b2, np.linalg.inv(Hs), a2.shape[::-1], borderMode=cv2.BORDER_REPLICATE)
     m_a = cv2.warpPerspective(ones_b, np.linalg.inv(Hs), a2.shape[::-1], flags=cv2.INTER_NEAREST)
     e = [energy(a_in_b, m_b), energy(b2, m_b), energy(a2, m_a), energy(b_in_a, m_a)]
     if any(v is None or v <= 0 for v in e):
         return None
     # (warped a vs native b) and (native a vs warped b): interpolation bias cancels
     return 0.5 * (np.log(e[0] / e[1]) + np.log(e[2] / e[3]))
+
+
+def local_scale(H: np.ndarray, x: float, y: float) -> float:
+    """Linear scale of homography H at (x, y): sqrt |det Jacobian|."""
+    w = H[2, 0] * x + H[2, 1] * y + H[2, 2]
+    p = (H[:2, :2] @ [x, y] + H[:2, 2]) / w
+    J = (H[:2, :2] - np.outer(p, H[2, :2])) / w
+    return float(np.sqrt(abs(np.linalg.det(J))))
 
 
 def seam_penalty(quality: float) -> float:
@@ -249,7 +275,8 @@ class Project:
         if fr.work_scale != 1.0:
             g = cv2.resize(g, None, fx=fr.work_scale, fy=fr.work_scale, interpolation=cv2.INTER_AREA)
         fr.reg = SR.normalise_for_features(g)
-        fr.sharpness = image_sharpness(fr.reg)
+        fr.qimg = quality_image(g)
+        fr.sharpness = image_sharpness(fr.qimg)
         # valid rectangle (in ref px) shared by all lenses
         m = 2.0
         x0, y0, x1, y1 = m, m, w - m, h - m
@@ -429,10 +456,15 @@ class Project:
         for (i, j), r in self.pairs.items():
             if not r.ok or r.H is None or r.method == "phasecorr":
                 continue
-            a, b = self.frames[i].reg, self.frames[j].reg
-            if a is None or b is None:
+            fa, fb = self.frames[i], self.frames[j]
+            a, b = getattr(fa, "qimg", None), getattr(fb, "qimg", None)
+            if a is not None and b is not None:   # quality images: half the working resolution
+                Hh = np.diag([0.5, 0.5, 1.0]) @ r.H @ np.diag([2.0, 2.0, 1.0])
+                ra = _overlap_log_ratio(a, b, Hh, s=1.0)
+            elif fa.reg is not None and fb.reg is not None:   # projects from older versions
+                ra = _overlap_log_ratio(fa.reg, fb.reg, r.H)
+            else:
                 continue
-            ra = _overlap_log_ratio(a, b, r.H)
             if ra is None:
                 continue
             rows.append((idx[i], idx[j]))
@@ -678,6 +710,7 @@ class Project:
         state = {k: v for k, v in self.__dict__.items() if k not in ("feats", "log", "registry")}
         for fr in state["frames"]:
             fr.reg = None  # working images are not needed for rendering
+            fr.qimg = None
         with open(path, "wb") as fh:
             pickle.dump({"mosaic2d": __version__, "state": state}, fh, protocol=4)
 
@@ -704,6 +737,19 @@ class Project:
         return proj
 
     # ------------------------------------------------------------------ output
+    def median_frame_scale(self) -> float:
+        """Median linear scale (mosaic px per native px) at the frame centres."""
+        r = self.result
+        sc = []
+        for fr in self.frames:
+            H = r.H.get(fr.index)
+            if H is None:
+                continue
+            d = local_scale(H, fr.ref_size[0] / 2.0, fr.ref_size[1] / 2.0)
+            if np.isfinite(d) and d > 0:
+                sc.append(d)
+        return float(np.median(sc)) if sc else 1.0
+
     def output_transform(self, resolution=None, orient=None):
         """Similarity T (mosaic px -> output px) and canvas size."""
         r = self.result
@@ -727,7 +773,10 @@ class Project:
             ang = np.arctan2(ax[1], ax[0])
             ca, sa = np.cos(-ang), np.sin(-ang)
             R = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]])
-        S = np.diag([resolution, resolution, 1.0])
+        # output px relative to the *median* frame's native px (not the anchor's:
+        # with varying camera height the anchor can be far from typical)
+        k = resolution / self.median_frame_scale()
+        S = np.diag([k, k, 1.0])
         T = S @ R
         q = cv2.perspectiveTransform(pts[None], T)[0]
         mn = np.floor(q.min(0)) - 2
@@ -814,7 +863,7 @@ class Project:
         rr = RD.Renderer(frames, dist, (W, H), self.band_sources(), len(bands), dtype,
                          blend=self.s.blend, work_dir=work / "_tmp_canvas", log=self.log,
                          flat=getattr(self, "flat", None), seams=self.s.seams,
-                         deghost=self.s.deghost,
+                         deghost=self.s.deghost, feather=getattr(self.s, "feather", True),
                          vis_bands=self.vis_channels(),
                          progress=lambda k, n: (k % 5 == 0 or k == n) and self.log(f"  rendered {k}/{n} frames"))
         prof = self.prof

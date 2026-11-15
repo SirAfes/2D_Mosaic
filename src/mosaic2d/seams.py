@@ -105,6 +105,25 @@ class SeamMap:
     labels: np.ndarray       # Hs x Ws int32 frame index, -1 = empty
     scale: float             # seam-map px per output px
     changed_frac: float = 0.0
+    # frame index -> (bx0, by0, smoothed indicator float32, usable uint8), seam-map px
+    soft: dict | None = None
+    sharpen: float = 2.5     # feather width ~ 1 / sharpen seam-map cells
+
+    def weight(self, fi, X, Y):
+        """
+        Feathering weight of frame ``fi`` at output coordinates: 1 inside its
+        seam region, 0 outside, a narrow linear ramp across the seamline, and 0
+        wherever the frame was judged unusable (moving object, blur). None if
+        the frame has no soft indicator.
+        """
+        if not self.soft or fi not in self.soft:
+            return None
+        bx0, by0, ind, use = self.soft[fi]
+        mx = (X * self.scale - bx0 - 0.5).astype(np.float32)
+        my = (Y * self.scale - by0 - 0.5).astype(np.float32)
+        v = cv2.remap(ind, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        u = cv2.remap(use, mx, my, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return np.clip((v - 0.5) * self.sharpen + 0.5, 0.0, 1.0) * (u > 0)
 
     def sample(self, X, Y):
         """
@@ -155,24 +174,15 @@ def voronoi_labels(frames, dist, size, scale, score_fn, map_fn):
     return label, (Ws, Hs)
 
 
-def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.25, weak_frac=None,
-                        halo_px=20, min_views=3, tile=512):
+def _per_view_stat(arrays, valids, boxes, size, reducer, min_views, tile=512):
     """
-    Per frame, pixels that disagree with the other frames (moving objects).
-
-    The per-pixel median over all frames that see a pixel is the consensus
-    (static scene). A frame's relative deviation from it is thresholded with
-    hysteresis: pixels above ``rel_thr`` are certain outliers (the rope itself);
-    optionally (``weak_frac``), pixels above ``weak_frac * rel_thr`` within
-    ``halo_px`` of a certain one are added (out-of-focus halo). Off by default:
-    on textured, relief-rich scenes the weak threshold also catches parallax.
-    Only pixels seen by at least ``min_views`` frames are judged. The median is
-    computed tile by tile to keep memory small.
+    For each frame, the per-pixel value of ``reducer`` (e.g. median) over all
+    frames covering the pixel, and the number of views. Tile by tile.
     """
     import warnings
     Ws, Hs = size
-    dev = [np.zeros(v.shape, np.float32) for v in valids]
-    boxes = [(cx, cy, cx + v.shape[1], cy + v.shape[0]) for (cx, cy), v in zip(corners, valids)]
+    stat = [np.full(v.shape, np.nan, np.float32) for v in valids]
+    views = [np.zeros(v.shape, np.int16) for v in valids]
     for ty in range(0, Hs, tile):
         for tx in range(0, Ws, tile):
             tx1, ty1 = min(Ws, tx + tile), min(Hs, ty + tile)
@@ -180,42 +190,101 @@ def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.
             if len(ks) < min_views:
                 continue
             stack = np.full((len(ks), ty1 - ty, tx1 - tx), np.nan, np.float32)
+            cut = []
             for n, k in enumerate(ks):
                 cx, cy, ex, ey = boxes[k]
                 x0, y0, x1, y1 = max(tx, cx), max(ty, cy), min(tx1, ex), min(ty1, ey)
-                part = lum[k][y0 - cy:y1 - cy, x0 - cx:x1 - cx]
-                vm = valids[k][y0 - cy:y1 - cy, x0 - cx:x1 - cx]
-                stack[n, y0 - ty:y1 - ty, x0 - tx:x1 - tx] = np.where(vm, part, np.nan)
+                src = (slice(y0 - cy, y1 - cy), slice(x0 - cx, x1 - cx))
+                dst = (slice(y0 - ty, y1 - ty), slice(x0 - tx, x1 - tx))
+                stack[n][dst] = np.where(valids[k][src], arrays[k][src], np.nan)
+                cut.append((k, src, dst))
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
-                med = np.nanmedian(stack, axis=0)
-                ref = np.nanmax(med) if np.isfinite(med).any() else 1.0
-            views = np.isfinite(stack).sum(0)
-            for n, k in enumerate(ks):
-                cx, cy, ex, ey = boxes[k]
-                x0, y0, x1, y1 = max(tx, cx), max(ty, cy), min(tx1, ex), min(ty1, ey)
-                sl = (slice(y0 - ty, y1 - ty), slice(x0 - tx, x1 - tx))
-                d = np.abs(stack[n][sl] - med[sl]) / (med[sl] + 0.05 * ref + 1e-6)
-                d = np.where(views[sl] >= min_views, np.nan_to_num(d), 0.0)
-                dev[k][y0 - cy:y1 - cy, x0 - cx:x1 - cx] = d
-    k3 = np.ones((3, 3), np.uint8)
+                red = reducer(stack)
+            nv = np.isfinite(stack).sum(0).astype(np.int16)
+            for k, src, dst in cut:
+                stat[k][src] = red[dst]
+                views[k][src] = nv[dst]
+    return stat, views
+
+
+def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.25, weak_frac=None,
+                        halo_px=20, min_views=3, min_object_px=6, veil_ratio=None, veil_sigma=8.0,
+                        min_area_frac=0.01, stats=None):
+    """
+    Per frame, pixels that disagree with the other frames.
+
+    Moving objects: the per-pixel median over all frames that see a pixel is the
+    consensus (static scene); a frame deviating from it by more than ``rel_thr``
+    (relative luminance) is an outlier there. Cleaned with an area filter
+    (``min_object_px``), not a morphological opening: thin objects such as a rope
+    are often only one or two seam-map pixels wide and an opening would erase
+    them. Optionally (``weak_frac``) a halo of weaker deviation around them.
+
+    Veils (optional, ``veil_ratio``): regional local contrast -- Laplacian
+    energy averaged over ``veil_sigma`` seam-map pixels, ignoring the moving
+    objects just found (their edges would otherwise make the frames that show
+    them look sharper) -- compared with the 75th percentile of all views. A frame
+    clearly below it over a coherent region (> ``min_area_frac`` of a frame) is
+    veiled or blurred there.
+
+    Only pixels seen by at least ``min_views`` frames are judged.
+    """
+    Ws, Hs = size
+    boxes = [(cx, cy, cx + v.shape[1], cy + v.shape[0]) for (cx, cy), v in zip(corners, valids)]
+    med, views = _per_view_stat(lum, valids, boxes, size, lambda st: np.nanmedian(st, axis=0), min_views)
+    ref = np.nanmax([np.nanmax(m) for m in med if np.isfinite(m).any()] or [1.0])
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     kh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * halo_px + 1, 2 * halo_px + 1))
-    out = []
-    for d in dev:
-        strong = cv2.morphologyEx((d > rel_thr).astype(np.uint8), cv2.MORPH_OPEN, k3)
-        if not strong.any():
-            out.append(np.zeros(d.shape, bool))
-            continue
-        core = strong > 0
-        if weak_frac:                                     # optional halo around a core
-            core |= (cv2.dilate(strong, kh) > 0) & (d > rel_thr * weak_frac)
-        out.append(cv2.dilate(core.astype(np.uint8), k7) > 0)
+    cores, n_bright = [], 0
+    for k in range(len(lum)):
+        d = np.abs(lum[k] - med[k]) / (med[k] + 0.05 * ref + 1e-6)
+        d = np.where((views[k] >= min_views) & valids[k], np.nan_to_num(d), 0.0)
+        core = d > rel_thr
+        if core.any():
+            n, lab, st, _ = cv2.connectedComponentsWithStats(core.astype(np.uint8), connectivity=8)
+            keep = st[:, cv2.CC_STAT_AREA] >= min_object_px
+            keep[0] = False
+            core = keep[lab]
+        if weak_frac and core.any():
+            core |= (cv2.dilate(core.astype(np.uint8), kh) > 0) & (d > rel_thr * weak_frac)
+        n_bright += int(core.sum())
+        cores.append(core)
+
+    n_veil = 0
+    if veil_ratio:
+        reg = []
+        for k in range(len(lum)):
+            g = cv2.GaussianBlur(lum[k].astype(np.float32), (0, 0), 0.8)
+            e = np.abs(cv2.Laplacian(g, cv2.CV_32F))
+            m = (valids[k] & ~(cv2.dilate(cores[k].astype(np.uint8), k7) > 0)).astype(np.float32)
+            num = cv2.GaussianBlur(e * m, (0, 0), veil_sigma)
+            den = cv2.GaussianBlur(m, (0, 0), veil_sigma)
+            reg.append(np.where(den > 0.3, num / np.maximum(den, 1e-6), np.nan).astype(np.float32))
+        regv = [v & np.isfinite(r) for v, r in zip(valids, reg)]
+        best, vv = _per_view_stat(reg, regv, boxes, size, lambda st: np.nanpercentile(st, 75, axis=0),
+                                  min_views)
+        floor = 0.25 * float(np.nanmedian(np.concatenate([r[np.isfinite(r)][::50] for r in reg])))
+        for k in range(len(lum)):
+            ratio = reg[k] / np.maximum(best[k], 1e-6)
+            veil = (ratio < veil_ratio) & (best[k] > floor) & (vv[k] >= min_views) & regv[k]
+            if veil.any():
+                min_area = max(20, int(min_area_frac * valids[k].size))
+                n, lab, st, _ = cv2.connectedComponentsWithStats(veil.astype(np.uint8), connectivity=8)
+                keep = st[:, cv2.CC_STAT_AREA] >= min_area
+                keep[0] = False
+                veil = keep[lab]
+                n_veil += int(veil.sum())
+                cores[k] = cores[k] | veil
+    out = [cv2.dilate(c.astype(np.uint8), k7) > 0 if c.any() else c for c in cores]
+    if stats is not None:
+        stats.update(bright=n_bright, veil=n_veil)
     return out
 
 
 def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=None,
-                   max_side=4000, frame_px=370, band_px=40, deghost=True, log=print) -> SeamMap:
+                   max_side=4000, frame_px=370, band_px=40, deghost=True, log=print,
+                   soft_sigma=1.0, veil_ratio=0.7) -> SeamMap:
     """
     frames : RenderFrame list (bbox set, output coordinates)
     images : frame index -> (h x w x 3 float32 image in reference-lens px * img_scale, img_scale)
@@ -274,7 +343,8 @@ def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=N
     n_ghost = 0
     if deghost:
         lum = [sv.mean(2) / 255.0 for sv in srcs]
-        outl = _consensus_outliers(lum, corners, valids, (Ws, Hs))
+        ostats = {}
+        outl = _consensus_outliers(lum, corners, valids, (Ws, Hs), stats=ostats, veil_ratio=veil_ratio)
         # coverage by non-outlier frames, to never exclude the only usable view
         good_cover = np.zeros((Hs, Ws), np.int16)
         for k, (cx, cy) in enumerate(corners):
@@ -328,11 +398,25 @@ def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=N
         sub[take] = fi
     holes = (final == -1) & (label >= 0)
     final[holes] = label[holes]
+    # smoothed per-frame indicators of the final seam regions -> feathering weights
+    soft = {}
+    for k, fi in enumerate(idx):
+        bx0, by0 = corners[k]
+        h, w = valids[k].shape
+        pad = 3
+        ind = np.zeros((h + 2 * pad, w + 2 * pad), np.float32)
+        ind[pad:pad + h, pad:pad + w] = final[by0:by0 + h, bx0:bx0 + w] == fi
+        ind = cv2.GaussianBlur(ind, (0, 0), soft_sigma)
+        use = np.zeros(ind.shape, np.uint8)
+        use[pad:pad + h, pad:pad + w] = usable[k]
+        soft[fi] = (bx0 - pad, by0 - pad, ind, use)
     base, _ = voronoi_labels(frames, dist, size, s, score_fn, map_fn)
     changed = float(((final != base) & (base >= 0)).sum()) / max(1, int((base >= 0).sum()))
     msg = f"  seamlines optimised (graph cut): {changed * 100:.1f} % of the area moved to another frame"
     if deghost:
-        msg += f"; {n_ghost * 100 / max(1, int((base >= 0).sum())):.1f} % of the area flagged as moving " \
-               "objects in some frame and taken from a consistent one"
+        area = max(1, int((base >= 0).sum()))
+        msg += (f"; inconsistent views replaced on {n_ghost * 100 / area:.1f} % of the area "
+                f"(moving objects {ostats.get('bright', 0) * 100 / area:.1f} %, "
+                f"veiled/blurred {ostats.get('veil', 0) * 100 / area:.1f} %, before overlap)")
     log(msg)
-    return SeamMap(final, s, changed)
+    return SeamMap(final, s, changed, soft)

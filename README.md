@@ -52,12 +52,12 @@ Important options (`mosaic2d run -h` lists all):
 | `--accuracy` | `medium` | matching resolution (max. side 6000/3600/2400/1200/700 px for highest…lowest) |
 | `--preselection` | `auto` | `auto` = sequential + generic + estimated; or `sequential`, `generic`, `exhaustive` |
 | `--blend` | `mosaic` | `mosaic` (two-band), `average` (feathered), `disabled` (no radiometric change) |
-| `--resolution` | 1.0 | output pixel size relative to the native pixels of the reference image |
+| `--resolution` | 1.0 | output pixel size relative to the native pixels of the median image (camera height can vary along a survey) |
 | `--no-distortion` | — | do not self-calibrate radial distortion |
 | `--seams` | `graphcut` | `graphcut`: seams move to where frames agree; `voronoi`: closest frame centre only |
 | `--no-deghost` | — | keep moving objects (by default areas where one frame disagrees with the others are taken from a consistent frame) |
 | `--flatfield` | `auto` | estimate and remove vignetting / fixed illumination from the series; `none` to keep raw radiometry |
-| `--gsd` | — | metres per pixel at resolution 1.0: GeoTIFF scale tags + `.tfw` world file |
+| `--gsd` | — | metres per native pixel of the median image (resolution 1.0): GeoTIFF scale tags + `.tfw` world file |
 | `--no-cache` | — | decode every image again instead of reusing `<out>/_cache` |
 | `--profile` | `auto` | `rgb`, `agrowing6`, `multiband` (pre-aligned TIFFs, e.g. msalign output) or a JSON file |
 
@@ -91,13 +91,13 @@ Band names and wavelengths are written to GDAL metadata, so QGIS shows "405 nm" 
 
 **Bundle adjustment.** All transforms are optimised together (Levenberg–Marquardt, Cauchy loss), minimising reprojection error in the pixels of the target image. A radial distortion (k1, k2) shared by all images is estimated with them — important for wide lenses and flat-port underwater housings. Pairs and points inconsistent with the solution are removed and the adjustment repeated (like gradual selection).
 
-**Image quality.** Blur (motion, defocus close to rocks) is measured where frames overlap: each accepted pair is compared on its common area only, in both directions, and the log ratios are solved for one sharpness per frame. Scene content (smooth rock vs. textured sand) therefore does not count as blur. Blurred frames give way to sharper overlapping frames.
+**Image quality.** Blur (motion, defocus close to rocks) is measured where frames overlap: each accepted pair is compared on its common area only, in both directions, and the log ratios are solved for one sharpness per frame. Scene content (smooth rock vs. textured sand) therefore does not count as blur. The comparison uses log-intensity images, so a hazy frame (an out-of-focus rope or hand in front of the lens) is not made to look detailed by contrast equalisation. Blurred and hazy frames give way to sharper overlapping frames.
 
 **Flat field.** Vignetting and a fixed illumination pattern (strobes, light from one side) multiply every frame of a series the same way. The per-pixel median of all frames (each divided by its own median) cancels the scene; a 2D polynomial fitted to it is divided out of every frame. On the underwater RGB test series the corners were at 0.63 of the centre brightness before correction.
 
-**Seamlines.** The closest-centre rule gives a good global layout but can put a seam straight through a moving object or an object with relief. Around each of those seams a band is opened and a graph cut (colour + gradient cost) moves the seam to where the frames agree. With *deghosting*, every pixel is also compared with the median of all frames that see it: a frame that disagrees (a floating rope, a fish, a diver's shadow) is not used there if another frame shows the pixel consistently.
+**Seamlines.** The closest-centre rule gives a good global layout but can put a seam straight through a moving object or an object with relief. Around each of those seams a band is opened and a graph cut (colour + gradient cost) moves the seam to where the frames agree. With *deghosting*, every pixel is also compared with the median of all frames that see it: a frame that disagrees (a floating rope, a fish, a diver's shadow) is not used there if another frame shows the pixel consistently. Areas where one frame shows clearly less detail than the others (a veil from an out-of-focus object close to the lens) are treated the same way. Seamlines get a narrow feathered transition (about one seam cell) instead of a hard cut.
 
-**Rendering.** The canvas is a disk-backed memmap; frames are decoded one at a time. Each output pixel comes from the frame chosen by the seamlines (closest to the image centre where nothing else matters, Metashape's rule). `mosaic` blending keeps the high frequencies of that frame and harmonises low frequencies across overlaps (a smooth per-frame gain field), which removes brightness steps from vignetting or strobes without ghosting. Use `--blend disabled` for quantitative multispectral analysis: pixel values are then exactly those of the source frames.
+**Rendering.** The canvas is a disk-backed memmap; frames are decoded one at a time. Each output pixel comes from the frame chosen by the seamlines (closest to the image centre where nothing else matters, Metashape's rule). `mosaic` blending keeps the high frequencies of that frame and harmonises low frequencies across overlaps (a smooth per-frame gain field), which removes brightness steps from vignetting or strobes without ghosting. Cells where a frame disagrees with the per-cell median of all frames (a rope or fish in that frame only) are left out of the gain estimate, so a removed object leaves no darker or brighter patch around it. Use `--blend disabled` for quantitative multispectral analysis: pixel values are then exactly those of the source frames.
 
 ## Benchmark
 
@@ -105,7 +105,7 @@ On an underwater RGB survey (57 × 61 MP Sony ARW) every method aligned all imag
 
 ## Limits
 
-A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax that no planar transform can remove — seams are placed near frame centres to keep it small; for true orthomosaics of rough terrain use SfM software with a dense surface model. Moving objects are removed only where at least three frames see the area and another frame shows it consistently; an object present in most frames stays. Where an object is removed, the replacing frame's own border can become a short, straight seam next to it (no graph cut there), and a faint out-of-focus halo of a rope close to the camera may remain. The geometry is relative: `--gsd` gives a metric scale but no georeferencing.
+A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax that no planar transform can remove — seams are placed near frame centres to keep it small; for true orthomosaics of rough terrain use SfM software with a dense surface model. Moving objects are removed only where at least three frames see the area and another frame shows it consistently; an object present in most frames stays. A veil or halo that every overlapping frame shows in the same place (for example at the edge of the survey, where few frames overlap) cannot be replaced and stays. The geometry is relative: `--gsd` gives a metric scale but no georeferencing.
 
 ## Development
 

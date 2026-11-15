@@ -62,10 +62,12 @@ def build_parser():
                    help="graphcut: move seams away from moving objects and parallax; voronoi: closest centre")
     r.add_argument("--no-deghost", dest="deghost", action="store_false",
                    help="keep moving objects (rope, fish) instead of taking those areas from consistent frames")
+    r.add_argument("--no-feather", dest="feather", action="store_false",
+                   help="hard seamlines (no narrow transition) in mosaic blending")
     r.add_argument("--flatfield", default="auto", choices=["auto", "none"],
                    help="estimate and remove vignetting / fixed illumination pattern from the series")
     r.add_argument("--resolution", type=float, default=1.0,
-                   help="output pixel size relative to the native pixels of the reference image "
+                   help="output pixel size relative to the native pixels of the median image "
                         "(0.5 = half resolution)")
     r.add_argument("--orient", default="pca", choices=["pca", "anchor"])
     r.add_argument("--name", default="mosaic")
@@ -86,6 +88,7 @@ def build_parser():
     rr.add_argument("--seams", default=None, choices=["graphcut", "voronoi"])
     rr.add_argument("--gsd", type=float, default=None)
     rr.add_argument("--no-deghost", dest="deghost", action="store_const", const=False, default=None)
+    rr.add_argument("--no-feather", dest="feather", action="store_const", const=False, default=None)
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
@@ -105,7 +108,8 @@ def main(argv=None):
         from .pipeline import Project
         proj = Project.load(args.project, args.out, blend=args.blend, resolution=args.resolution,
                             orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir,
-                            seams=args.seams, deghost=args.deghost, gsd=args.gsd)
+                            seams=args.seams, deghost=args.deghost, gsd=args.gsd,
+                            feather=args.feather)
         proj.render(args.name)
         proj.report(args.name)
         return 0

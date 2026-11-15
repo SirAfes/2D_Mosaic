@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from mosaic2d import rawio
-from mosaic2d.pipeline import Settings, run
+from mosaic2d.pipeline import Settings, local_scale, run
 
 
 def _texture(w, h, seed=0):
@@ -67,6 +67,9 @@ def test_synthetic_survey(tmp_path, blend):
         c = np.array([[[450.0, 300.0], [0, 0], [900, 600]]])
         errs.append(np.abs(cv2.perspectiveTransform(c, rel_true) - cv2.perspectiveTransform(c, rel_est)).max())
     assert max(errs) < 3.0, errs
+    # output scale refers to the median frame, whichever frame is the anchor
+    s_true = np.median([local_scale(np.linalg.inv(Ha_true) @ truth[n], 450, 300) for n in names])
+    assert abs(proj.median_frame_scale() / s_true - 1) < 0.01
     out = tmp_path / "out" / "mosaic.tif"
     assert out.is_file()
     img = rawio.read_image(out)

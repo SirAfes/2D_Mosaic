@@ -92,3 +92,108 @@ def test_deghost_removes_object_seen_in_one_frame_only(tmp_path):
     out = render(True)
     assert (out[bar][..., 0] < 1600).mean() < 0.05
     assert (out[..., 0] > 0).mean() > 0.99
+
+
+def test_feather_weights_sum_to_one_and_ramp():
+    from mosaic2d.seams import SeamMap
+    H, W = 40, 80
+    labels = np.zeros((H, W), np.int32)
+    labels[:, 40:] = 1
+    soft = {}
+    for fi in (0, 1):
+        ind = cv2.GaussianBlur((labels == fi).astype(np.float32), (0, 0), 1.0)
+        soft[fi] = (0, 0, ind, np.ones((H, W), np.uint8))
+    sm = SeamMap(labels, 0.1, 0.0, soft)                 # 1 seam cell = 10 output px
+    X, Y = np.meshgrid(np.arange(0, 800, dtype=np.float64), np.full(1, 200.0))
+    w0, w1 = sm.weight(0, X, Y)[0], sm.weight(1, X, Y)[0]
+    assert np.allclose((w0 + w1)[20:780], 1, atol=1e-5)    # map border excluded (real maps are padded)
+    assert w0[20:350].min() == 1 and w0[450:780].max() == 0
+    ramp = np.flatnonzero((w0[20:780] > 0) & (w0[20:780] < 1))
+    assert 3 <= ramp.size <= 25                          # narrow transition (~1 cell)
+
+
+def test_seam_accumulator_weighted_mean():
+    from mosaic2d.render import _SeamAccumulator
+    out = np.full((70, 70, 2), 7, np.uint16)
+    acc = _SeamAccumulator(2, tile=32)
+    m = np.zeros((70, 70), bool)
+    m[30:40, 25:45] = True
+    acc.add(0, 0, m, np.full((70, 70, 2), 100.0, np.float32), np.full((70, 70), 0.25, np.float32))
+    acc.add(0, 0, m, np.full((70, 70, 2), 200.0, np.float32), np.full((70, 70), 0.75, np.float32))
+    acc.flush(out, 65535, np.uint16)
+    assert (out[30:40, 25:45] == 175).all()
+    assert (out[~m] == 7).all()
+
+
+def test_seam_accumulator_keeps_directly_written_owner():
+    """A lone band contribution (weight 0.25) mixes with the pixel's owner, which
+    was written directly (weight >= 0.998), instead of replacing it."""
+    from mosaic2d.render import _SeamAccumulator
+    out = np.full((40, 40, 1), 1000, np.uint16)
+    acc = _SeamAccumulator(1, tile=32)
+    m = np.zeros((40, 40), bool)
+    m[5:15, 5:35] = True
+    acc.add(0, 0, m, np.full((40, 40, 1), 200.0, np.float32), np.full((40, 40), 0.25, np.float32))
+    acc.flush(out, 65535, np.uint16)
+    assert (out[5:15, 5:35] == 800).all()            # 0.25 * 200 + 0.75 * 1000
+    empty = np.zeros((40, 40, 1), np.uint16)         # nothing written: band value alone
+    acc.add(0, 0, m, np.full((40, 40, 1), 200.0, np.float32), np.full((40, 40), 0.25, np.float32))
+    acc.flush(empty, 65535, np.uint16)
+    assert (empty[5:15, 5:35] == 200).all()
+
+
+def test_veiled_region_taken_from_sharp_frames(tmp_path):
+    """A frame veiled in one area (out-of-focus object in front of the lens: low
+    contrast, same mean brightness) gives that area to frames that show it sharply."""
+    world = _texture(900, 400, seed=11).astype(np.float32)
+    frames, imgs = [], {}
+    for k, x in enumerate((0, 150, 300)):
+        img = world[:, x:x + 600].copy()
+        if k == 1:
+            reg = img[80:320, 250:450]
+            m = reg.mean(axis=(0, 1), keepdims=True)
+            img[80:320, 250:450] = m + 0.25 * (reg - m)        # veil: contrast down to 25 %
+        H = np.array([[1, 0, x], [0, 1, 0], [0, 0, 1]], np.float64)
+        frames.append(RD.RenderFrame(k, "", H, (600, 400), (0, 0, 600, 400), {1: np.eye(3)},
+                                     thumb=cv2.resize(img, (150, 100), interpolation=cv2.INTER_AREA).astype(np.uint16),
+                                     thumb_scale=0.25, seam_img=img.astype(np.uint16), seam_scale=1.0))
+        imgs[k] = img.astype(np.uint16)
+    dist = RD.Distortion(np.zeros(2), np.array([300.0, 200.0]), 360.0)
+
+    def render(deghost):
+        rr = RD.Renderer(frames, dist, (900, 400), [(1, 0), (1, 1), (1, 2)], 3, np.uint16,
+                         blend="disabled", work_dir=tmp_path / f"v{deghost}", log=lambda *a: None,
+                         seams="graphcut", deghost=deghost, strip=128)
+        return np.array(rr.render(lambda fr: {1: imgs[fr.index]})).astype(np.float32)
+    area = (slice(120, 280), slice(440, 560))                  # inside the veil, world coordinates
+    truth = world[area][..., 0]
+
+    def detail(a):
+        return np.abs(cv2.Laplacian(a[area][..., 0], cv2.CV_32F)).mean()
+    assert detail(render(False)) < 0.5 * detail(world)        # middle frame (veiled) wins
+    sharp = render(True)
+    assert detail(sharp) > 0.85 * detail(world)
+    assert np.abs(sharp[area][..., 0] - truth).mean() < 0.05 * truth.mean()
+
+
+def test_gain_field_ignores_object_seen_in_one_frame(tmp_path):
+    """A bright object in one frame only must not darken that frame around it
+    (the darkening would stay after deghosting removes the object)."""
+    world = _texture(900, 400, seed=3).astype(np.float32)
+    frames = []
+    for k, x in enumerate((0, 150, 300)):
+        img = world[:, x:x + 600].copy()
+        if k == 1:
+            img[:, 440 - x:470 - x] = 60000                    # bright rope, middle frame only
+        H = np.array([[1, 0, x], [0, 1, 0], [0, 0, 1]], np.float64)
+        frames.append(RD.RenderFrame(k, "", H, (600, 400), (0, 0, 600, 400), {1: np.eye(3)},
+                                     thumb=cv2.resize(img, (150, 100), interpolation=cv2.INTER_AREA).astype(np.uint16),
+                                     thumb_scale=0.25))
+    dist = RD.Distortion(np.zeros(2), np.array([300.0, 200.0]), 360.0)
+    rr = RD.Renderer(frames, dist, (900, 400), [(1, 0), (1, 1), (1, 2)], 3, np.uint16,
+                     blend="mosaic", work_dir=tmp_path / "g", log=lambda *a: None, seams="voronoi")
+    rr.low_frequency_pass()
+    X, Y = np.meshgrid(np.array([400.0, 420.0, 490.0, 510.0]), np.array([150.0, 250.0]))
+    g = rr._gain_at(frames[1], X, Y)
+    assert np.abs(g - 1).max() < 0.12, g[..., 0]
+    RD.cleanup(rr)
