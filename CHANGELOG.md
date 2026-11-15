@@ -11,9 +11,10 @@
   (out-of-focus rope or hand close to the lens) are taken from frames that show them sharply.
 - Image quality is measured on log-intensity images instead of contrast-equalised (CLAHE)
   images; CLAHE had inflated the detail of hazy frames, so the hazy views were preferred.
-- Gain fields (two-band blending) ignore cells where a frame disagrees with the per-cell
-  median of all frames: a rope seen by one frame no longer darkens that frame around it
-  (dark blocks next to removed objects).
+- Gain fields (two-band blending) ignore cells where a frame is a minority outlier
+  against the per-cell median of all frames: a rope seen by one frame no longer darkens
+  that frame around it (dark blocks next to removed objects). Where most views disagree
+  (relief, parallax) nothing is left out, so the gains stay stable.
 - Feathering keeps the weight of the frame that owns a pixel outright; a lone minor band
   contribution can no longer replace it.
 - `--resolution` (and `--gsd`) refer to the native pixel of the median frame, not of the

@@ -312,20 +312,38 @@ class Renderer:
             acc2[by0:by0 + h, bx0:bx0 + w] += t * wt[..., None]
             wsum2[by0:by0 + h, bx0:bx0 + w] += wt
         L2 = np.where((wsum2 > 1e-6)[..., None], acc2 / np.maximum(wsum2, 1e-9)[..., None], L)
-        Lb = cv2.GaussianBlur(L2.astype(np.float32), (0, 0), sig)
+        # Outlier exclusion is only meant for thin or small objects. Where most
+        # cells disagree (relief and parallax on rocks), the reduced estimate is
+        # unstable, so it fades back to the plain all-cell estimate.
+        wide = 4.0 * sig
+        q = (cv2.GaussianBlur(wsum2.astype(np.float32), (0, 0), wide)
+             / np.maximum(cv2.GaussianBlur(wsum.astype(np.float32), (0, 0), wide), 1e-9))
+        kL = np.clip((q - 0.15) / 0.3, 0, 1)[..., None]
+        Lb = cv2.GaussianBlur((kL * L2 + (1 - kL) * L).astype(np.float32), (0, 0), sig)
+        Lb_all = cv2.GaussianBlur(L.astype(np.float32), (0, 0), sig)
+
+        def masked_blur(t, m, h, w):
+            tb = cv2.GaussianBlur(t.astype(np.float32) * m[..., None], (0, 0), sig)
+            nb = cv2.GaussianBlur(m, (0, 0), sig)
+            return tb.reshape(h, w, -1) / np.maximum(nb, 1e-6)[..., None]
+
         for fr in self.frames:
             if fr.index not in own:
                 continue
             bx0, by0, t, valid = own[fr.index]
             h, w = valid.shape
+            va = valid.astype(np.float32)
             vm = (valid & inl[fr.index]).astype(np.float32)
+            f = (cv2.GaussianBlur(vm, (0, 0), wide)
+                 / np.maximum(cv2.GaussianBlur(va, (0, 0), wide), 1e-6))
+            k = np.clip((f - 0.15) / 0.3, 0, 1).reshape(h, w, 1)
             if vm.sum() < 0.2 * max(valid.sum(), 1):
-                vm = valid.astype(np.float32)
+                k = np.zeros_like(k)
             # normalised (masked) blur of the frame's own low-res image
-            tb = cv2.GaussianBlur(t.astype(np.float32) * vm[..., None], (0, 0), sig)
-            nb = cv2.GaussianBlur(vm, (0, 0), sig)
-            tb = tb.reshape(h, w, -1) / np.maximum(nb, 1e-6)[..., None]
-            Lf = Lb[by0:by0 + h, bx0:bx0 + w].reshape(h, w, -1)
+            tb_all = masked_blur(t, va, h, w)
+            tb = k * masked_blur(t, vm, h, w) + (1 - k) * tb_all
+            Lf = (k * Lb[by0:by0 + h, bx0:bx0 + w].reshape(h, w, -1)
+                  + (1 - k) * Lb_all[by0:by0 + h, bx0:bx0 + w].reshape(h, w, -1))
             g = Lf / np.maximum(tb, 1e-3 * max(float(tb.mean()), 1e-6))
             g = np.clip(np.where(valid[..., None], g, 1.0), 0.33, 3.0).astype(np.float32)
             g = cv2.GaussianBlur(g, (0, 0), 1.0).reshape(h, w, -1)
@@ -371,7 +389,21 @@ class Renderer:
                 ref = (cv2.GaussianBlur((r * mf).astype(np.float32), (0, 0), sig)
                        / np.maximum(cv2.GaussianBlur(mf, (0, 0), sig), 1e-6))
                 m = valid & (np.abs(r - ref) < thr)
-            bad = cv2.dilate((valid & ~m).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+            out[fi] = m
+        # A frame is left out of a cell only as a minority: where most views of
+        # the cell disagree with the median (relief / parallax), none is left out.
+        agree = np.zeros((Hl, Wl), np.float32)
+        views = np.zeros((Hl, Wl), np.float32)
+        for fi, (bx0, by0, t, valid) in own.items():
+            h, w = valid.shape
+            agree[by0:by0 + h, bx0:bx0 + w] += out[fi]
+            views[by0:by0 + h, bx0:bx0 + w] += valid
+        frac = agree / np.maximum(views, 1)
+        for fi, (bx0, by0, t, valid) in own.items():
+            h, w = valid.shape
+            cons = (frac[by0:by0 + h, bx0:bx0 + w] >= 0.6) & (views[by0:by0 + h, bx0:bx0 + w] >= 3)
+            bad = valid & ~out[fi] & cons
+            bad = cv2.dilate(bad.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
             out[fi] = valid & ~bad
         return out
 

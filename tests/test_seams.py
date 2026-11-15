@@ -197,3 +197,33 @@ def test_gain_field_ignores_object_seen_in_one_frame(tmp_path):
     g = rr._gain_at(frames[1], X, Y)
     assert np.abs(g - 1).max() < 0.12, g[..., 0]
     RD.cleanup(rr)
+
+
+def test_gain_field_stable_where_all_frames_disagree(tmp_path):
+    """Relief / parallax: every frame shows the overlap differently. Nothing is a
+    minority outlier there, so the gains stay close to the plain estimate."""
+    frames = []
+    for k, x in enumerate((0, 150, 300)):
+        img = _texture(600, 400, seed=20 + k).astype(np.float32)       # unrelated content
+        H = np.array([[1, 0, x], [0, 1, 0], [0, 0, 1]], np.float64)
+        frames.append(RD.RenderFrame(k, "", H, (600, 400), (0, 0, 600, 400), {1: np.eye(3)},
+                                     thumb=cv2.resize(img, (150, 100), interpolation=cv2.INTER_AREA).astype(np.uint16),
+                                     thumb_scale=0.25))
+    dist = RD.Distortion(np.zeros(2), np.array([300.0, 200.0]), 360.0)
+
+    def gains(robust):
+        if not robust:
+            orig = RD.Renderer._gain_inliers
+            RD.Renderer._gain_inliers = staticmethod(lambda own, L, **kw: {fi: v[3] for fi, v in own.items()})
+        try:
+            rr = RD.Renderer(frames, dist, (900, 400), [(1, 0), (1, 1), (1, 2)], 3, np.uint16,
+                             blend="mosaic", work_dir=tmp_path / str(robust), log=lambda *a: None,
+                             seams="voronoi")
+            rr.low_frequency_pass()
+        finally:
+            if not robust:
+                RD.Renderer._gain_inliers = staticmethod(orig)
+        X, Y = np.meshgrid(np.arange(320.0, 580.0, 20.0), np.array([120.0, 200.0, 280.0]))
+        return np.array([rr._gain_at(f, X, Y) for f in frames])
+    plain, robust = gains(False), gains(True)
+    assert np.abs(np.log(robust / plain)).max() < np.log(1.4)      # no blow-up (was 3x on MS rocks)
