@@ -18,6 +18,14 @@ mosaic (Big)TIFF or tiles + VRT · preview · seam map · reports
 
 ## Install
 
+### Windows, without Python
+
+Download `mosaic2d-<version>-windows-x64.zip` from the **Releases** page of this repository, extract it anywhere and double-click `mosaic2d\mosaic2d.exe`. A window opens: choose the photo folder, the output folder, the resolution and press **Run**; the log shows progress and **Open output folder** shows the results. The same file works from a terminal with all options below (`mosaic2d.exe run D:\photos\RGB --resolution 0.5`).
+
+Windows may warn about an unknown publisher the first time (the executable is not code-signed): *More info → Run anyway*. Keep the whole extracted folder together; the `.exe` needs the files next to it.
+
+### With Python
+
 Python ≥ 3.10:
 
 ```bash
@@ -112,7 +120,10 @@ A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax 
 ```bash
 pip install -e ".[dev]"
 pytest
+mosaic2d gui          # the window, also without building the executable
 ```
+
+Releases: push a version tag (`git tag v0.3.0 && git push --tags`). The `build-windows` workflow runs the tests, builds `mosaic2d.exe` with PyInstaller on Windows, checks it on a small synthetic survey and attaches the zip to a GitHub Release. *Actions → build-windows → Run workflow* builds a zip without a release.
 
 Tests: synthetic bundle adjustment with known transforms and distortion, an end-to-end synthetic zig-zag survey with known geometry, blur detection, seamlines around and removal of a moving object, flat-field recovery, Sony cRAW decoding, cache reuse and TIFF/BigTIFF/VRT/world-file round trips.
 

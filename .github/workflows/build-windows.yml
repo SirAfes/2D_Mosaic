@@ -1,0 +1,70 @@
+name: build-windows
+
+# Builds mosaic2d.exe (with the window) on a Windows machine.
+#  - every push of a version tag (v0.3.0, v0.4.0, ...) → zip attached to a GitHub Release
+#  - "Run workflow" button on the Actions tab → zip downloadable from the run page
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]" "pyinstaller==6.11.1"
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Build mosaic2d.exe
+        run: >
+          pyinstaller --noconfirm --clean --console --name mosaic2d
+          --paths src
+          --collect-submodules mosaic2d
+          --hidden-import tkinter
+          packaging/mosaic2d_exe.py
+
+      - name: Check the executable
+        shell: pwsh
+        run: |
+          $exe = "dist\mosaic2d\mosaic2d.exe"
+          & $exe --version; if ($LASTEXITCODE) { exit 1 }
+          & $exe methods; if ($LASTEXITCODE) { exit 1 }
+          & $exe gui --selftest; if ($LASTEXITCODE) { exit 1 }
+          python packaging/make_smoke_data.py smoke\src
+          & $exe run smoke\src -o smoke\out --resolution 0.5 --no-cache; if ($LASTEXITCODE) { exit 1 }
+          if (-not (Test-Path smoke\out\mosaic.tif)) { Write-Error "no mosaic written"; exit 1 }
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          $v = (& dist\mosaic2d\mosaic2d.exe --version).Trim()
+          Copy-Item README.md, LICENSE, CHANGELOG.md dist\mosaic2d\
+          Compress-Archive -Path dist\mosaic2d -DestinationPath "mosaic2d-$v-windows-x64.zip"
+          "ZIP=mosaic2d-$v-windows-x64.zip" | Out-File -Append $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mosaic2d-windows-x64
+          path: ${{ env.ZIP }}
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true

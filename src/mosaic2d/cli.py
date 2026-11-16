@@ -4,6 +4,7 @@ Command line interface.
     mosaic2d run FOLDER [-o OUT] [options]        build a mosaic
     mosaic2d benchmark FOLDER [-o OUT] [options]  compare feature methods
     mosaic2d methods                              list methods and availability
+    mosaic2d gui                                  window for choosing folders and options
 """
 
 from __future__ import annotations
@@ -94,11 +95,18 @@ def build_parser():
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
     _add_common(b)
     sub.add_parser("methods", help="list feature methods")
+    g = sub.add_parser("gui", help="open a window for choosing folders and options")
+    g.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     return ap
 
 
 def main(argv=None):
+    if argv is None and len(sys.argv) == 1 and getattr(sys, "frozen", False):
+        argv = ["gui"]                       # double-clicked executable: open the window
     args = build_parser().parse_args(argv)
+    if args.cmd == "gui":
+        from .gui import main as gui_main
+        return gui_main(selftest=args.selftest)
     if args.cmd == "methods":
         reg = FT.build_registry()
         for m in reg.values():

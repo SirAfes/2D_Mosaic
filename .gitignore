@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 *.canvas
 _tmp_*/
+build/
+dist/
+*.spec

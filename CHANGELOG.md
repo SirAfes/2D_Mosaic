@@ -2,6 +2,9 @@
 
 ## 0.3.0
 
+- Windows executable (`mosaic2d.exe`, built by GitHub Actions on every version tag)
+  with a small window: choose folders and options, follow the log, open the results.
+  `mosaic2d gui` opens the same window from a Python installation.
 - Seamline feathering: a narrow transition (about one seam cell) across every seamline
   instead of a hard cut, so the short straight seams next to removed objects no longer
   show as steps (`--no-feather` restores hard seams).
