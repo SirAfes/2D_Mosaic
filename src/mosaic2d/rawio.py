@@ -129,6 +129,58 @@ def read_tiff_structure(path) -> TiffInfo | None:
         return info
 
 
+def tiff_band_info(path) -> dict:
+    """
+    Band names and centre wavelengths (nm) stored in a multiband TIFF:
+    GDAL_METADATA items (DESCRIPTION / wavelength / CENTRAL_WAVELENGTH_UM, as
+    written by GDAL, msalign and mosaic2d) or an msalign JSON ImageDescription.
+    Returns {band index (0-based): (name or None, wavelength nm or None)}.
+    """
+    import html
+    import json
+    import re
+    try:
+        info = read_tiff_structure(path)
+    except (OSError, struct.error):
+        return {}
+    if not info or not info.ifds:
+        return {}
+    tags = info.ifds[0]
+    names, wls = {}, {}
+    meta = tags.get(42112)
+    if isinstance(meta, str) and "<GDALMetadata" in meta:
+        unit = 1.0
+        for attrs, val in re.findall(r"<Item\s+([^>]*)>([^<]*)</Item>", meta):
+            a = dict(re.findall(r'(\w+)="([^"]*)"', attrs))
+            v = html.unescape(val).strip()
+            if a.get("name", "").lower() == "wavelength_units" and "sample" not in a:
+                unit = 1000.0 if v.lower() in ("um", "micrometers", "micrometer", "µm") else 1.0
+        for attrs, val in re.findall(r"<Item\s+([^>]*)>([^<]*)</Item>", meta):
+            a = dict(re.findall(r'(\w+)="([^"]*)"', attrs))
+            if "sample" not in a:
+                continue
+            k, key, v = int(a["sample"]), a.get("name", ""), html.unescape(val).strip()
+            try:
+                if key == "DESCRIPTION" and v:
+                    names[k] = v
+                elif key == "CENTRAL_WAVELENGTH_UM":
+                    wls[k] = float(v) * 1000.0
+                elif key.lower() == "wavelength" and k not in wls:
+                    wls[k] = float(v) * unit
+            except ValueError:
+                pass
+    desc = tags.get(270)
+    if not names and isinstance(desc, str) and desc.lstrip().startswith("{"):
+        try:
+            for k, b in enumerate(json.loads(desc).get("bands", [])):
+                names[k] = b.get("name")
+                if b.get("center_wavelength_nm") is not None:
+                    wls[k] = float(b["center_wavelength_nm"])
+        except (ValueError, AttributeError, TypeError):
+            pass
+    return {k: (names.get(k), wls.get(k)) for k in sorted(set(names) | set(wls))}
+
+
 EXIF_NAMES = {
     271: "make", 272: "model", 306: "datetime", 33434: "exposure_time", 33437: "f_number",
     34855: "iso", 36867: "datetime_original", 37386: "focal_length",
@@ -391,6 +443,6 @@ def read_image(path, demosaic_mode: str = "bilinear") -> np.ndarray:
         raise IOError(f"Could not read image {path}")
     if img.ndim == 2:
         return img[..., None]
-    if img.shape[2] >= 3:
+    if img.shape[2] in (3, 4):                # OpenCV colour order is BGR(A); multiband stays as stored
         img = img[..., [2, 1, 0] + list(range(3, img.shape[2]))]
     return img

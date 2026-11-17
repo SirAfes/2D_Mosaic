@@ -66,8 +66,9 @@ Important options (`mosaic2d run -h` lists all):
 | `--no-deghost` | — | keep moving objects (by default areas where one frame disagrees with the others are taken from a consistent frame) |
 | `--flatfield` | `auto` | estimate and remove vignetting / fixed illumination from the series; `none` to keep raw radiometry |
 | `--gsd` | — | metres per native pixel of the median image (resolution 1.0): GeoTIFF scale tags + `.tfw` world file |
+| `--min-block` | 5 | groups of connected images with no overlap to the largest group (gaps in the coverage) are rendered on their own as `<name>_blockNN` if they have at least this many images; `<name>_blocks.csv` lists all groups; `0` = largest group only |
 | `--no-cache` | — | decode every image again instead of reusing `<out>/_cache` |
-| `--profile` | `auto` | `rgb`, `agrowing6`, `multiband` (pre-aligned TIFFs, e.g. msalign output) or a JSON file |
+| `--profile` | `auto` | `rgb`, `agrowing6`, `multiband` (pre-aligned TIFFs, e.g. msalign output; band names and wavelengths are read from the file) or a JSON file |
 
 ## Outputs
 

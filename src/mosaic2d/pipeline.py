@@ -71,6 +71,7 @@ class Settings:
     work_dir: str | None = None
     keep_canvas: bool = False
     tile_size: int = 0               # >0: write tiles of this size + a VRT instead of one TIFF
+    min_block: int = 5               # also render other connected groups of >= this many images (0: largest only)
     seams: str = "graphcut"          # graphcut (optimised seamlines) | voronoi (closest centre)
     cache: bool = True               # reuse decoded/prepared frames between runs (<out>/_cache)
     deghost: bool = True             # keep moving objects (rope, fish) out of the mosaic where possible
@@ -154,6 +155,14 @@ def _overlap_log_ratio(a: np.ndarray, b: np.ndarray, H: np.ndarray, s: float = 0
         return None
     # (warped a vs native b) and (native a vs warped b): interpolation bias cancels
     return 0.5 * (np.log(e[0] / e[1]) + np.log(e[2] / e[3]))
+
+
+def short_label(stem: str) -> str:
+    """Short frame label for seam maps: the image number if there is one
+    (DSC06795_ARW_aligned_multiband -> 6795), else the last characters."""
+    import re
+    nums = re.findall(r"\d{3,}", stem)
+    return nums[0][-4:] if nums else stem[-4:]
 
 
 def local_scale(H: np.ndarray, x: float, y: float) -> float:
@@ -641,23 +650,8 @@ class Project:
         nodes = [f.index for f in self.frames]
         if not corr:
             raise RuntimeError("No image pair could be matched")
-        self.result = BA.run_bundle(nodes, corr, pairH, sizes, model=self.s.model,
-                                    distortion=self.s.distortion, log=self.log)
-        bad = self.degenerate_frames()
-        if bad and self.s.model == "homography":
-            # long chains: perspective terms are weakly constrained and drift
-            # until the far frames fold over; the affine model cannot fold
-            self.log(f"  {len(bad)} frame(s) degenerate under the homography model "
-                     "(perspective drift along the chain); adjusting again with the affine model")
-            self.s.model = "affine"
-            self.result = BA.run_bundle(nodes, corr, pairH, sizes, model=self.s.model,
-                                        distortion=self.s.distortion, log=self.log)
-            bad = self.degenerate_frames()
-        if bad:
-            names = ", ".join(self.frames[i].path.name for i in bad[:12]) + (" ..." if len(bad) > 12 else "")
-            self.log(f"  {len(bad)} frame(s) left out of the mosaic (degenerate geometry): {names}")
-            for i in bad:
-                self.result.H.pop(i, None)
+        self.result, self.s.model = self._solve(nodes, corr, pairH, sizes, self.s.model,
+                                                self.s.distortion)
         r = self.result
         for rem in r.removed_pairs:
             key = (rem["i"], rem["j"])
@@ -670,10 +664,76 @@ class Project:
                  f"k1={r.k[0]:+.4f} k2={r.k[1]:+.4f}, anchor {self.frames[r.anchor].path.name}")
         self.timing["adjustment_s"] = self.timing.get("adjustment_s", 0) + time.time() - t
 
-    def degenerate_frames(self, max_scale_ratio=3.0, max_aniso=3.0) -> list:
+    def _solve(self, nodes, corr, pairH, sizes, model, distortion):
+        """Bundle adjustment with a geometry check. Returns (result, model used)."""
+        r = BA.run_bundle(nodes, corr, pairH, sizes, model=model, distortion=distortion, log=self.log)
+        bad = self.degenerate_frames(r)
+        if bad and model == "homography":
+            # long chains: perspective terms are weakly constrained and drift
+            # until the far frames fold over; the affine model cannot fold
+            self.log(f"  {len(bad)} frame(s) degenerate under the homography model "
+                     "(perspective drift along the chain); adjusting again with the affine model")
+            model = "affine"
+            r = BA.run_bundle(nodes, corr, pairH, sizes, model=model, distortion=distortion, log=self.log)
+            bad = self.degenerate_frames(r)
+        if bad:
+            names = ", ".join(self.frames[i].path.name for i in bad[:12]) + (" ..." if len(bad) > 12 else "")
+            self.log(f"  {len(bad)} frame(s) left out of the mosaic (degenerate geometry): {names}")
+            for i in bad:
+                r.H.pop(i, None)
+        return r, model
+
+    def render_blocks(self, name="mosaic"):
+        """
+        Groups of images that share no overlap with the largest group (gaps in
+        the coverage) are adjusted and rendered on their own as
+        <name>_blockNN; <name>_blocks.csv lists all groups.
+        """
+        main_result = self.result
+        main_out = (getattr(self, "canvas_size", None), getattr(self, "T_out", None))
+        comps = [c for c in main_result.components]
+        results = [(comps[0], f"{name}.tif")]
+        extra = [c for c in comps[1:] if len(c) >= self.s.min_block]
+        small = sum(len(c) for c in comps[1:] if len(c) < self.s.min_block)
+        if not extra:
+            if len(comps) > 1:
+                self.log(f"  {len(comps) - 1} smaller group(s) ({small} images) below --min-block "
+                         f"{self.s.min_block}; not rendered")
+            return []
+        self.log(f"  {len(extra)} more group(s) of >= {self.s.min_block} images without overlap with "
+                 f"the main block; rendering each on its own ({small} images in smaller groups skipped)")
+        corr, pairH, sizes = self._corr()
+        model0 = self.s.model
+        try:
+            for k, comp in enumerate(extra, start=2):
+                bname = f"{name}_block{k:02d}"
+                cs = set(comp)
+                c_sub = [c for c in corr if c.i in cs and c.j in cs]
+                p_sub = {e: H for e, H in pairH.items() if e[0] in cs and e[1] in cs}
+                self.log(f"block {k}: {len(comp)} images ({self.frames[comp[0]].path.name} ...)")
+                try:
+                    # few images cannot constrain lens distortion reliably
+                    self.result, _ = self._solve(comp, c_sub, p_sub, sizes, model0,
+                                                 self.s.distortion and len(comp) >= 15)
+                    self.render(bname)
+                    results.append((comp, f"{bname}.tif"))
+                except Exception as e:            # one bad group must not stop the others
+                    self.log(f"  block {k} not rendered: {e}")
+                    results.append((comp, f"not rendered: {e}"))
+        finally:
+            self.result = main_result
+            self.canvas_size, self.T_out = main_out
+        for c in comps[1:]:
+            if len(c) < self.s.min_block:
+                results.append((c, "below --min-block"))
+        path = _block_report_rows(self, name, results)
+        self.log(f"  groups listed in {path.name}")
+        return results
+
+    def degenerate_frames(self, r=None, max_scale_ratio=3.0, max_aniso=3.0) -> list:
         """Frames whose adjusted transform folds (a corner on or behind the
         horizon), is strongly stretched, or whose scale is far from the median."""
-        r = self.result
+        r = r if r is not None else self.result
         scales, bad = {}, []
         for fr in self.frames:
             H = r.H.get(fr.index)
@@ -777,6 +837,17 @@ class Project:
         proj.log = Log(proj.out / "mosaic2d_render.log")
         proj.feats = {}
         proj.registry = FT.build_registry(proj.s.n_features)
+        if proj.prof.name == "multiband" and all(b.name.startswith("band ") for b in proj.prof.bands):
+            try:                                   # projects from before band metadata was read
+                prof = SR.get_profile("multiband", proj.files[0])
+                if len(prof.bands) == len(proj.prof.bands) and prof.bands != proj.prof.bands:
+                    proj.prof = prof
+                    if proj.ref_band is not None:
+                        proj.ref_band = next((b for b in prof.bands if b.channel == proj.ref_band.channel),
+                                             proj.ref_band)
+                    proj.log(f"  band names from the image metadata: {', '.join(b.name for b in prof.bands)}")
+            except Exception:
+                pass
         return proj
 
     # ------------------------------------------------------------------ output
@@ -884,6 +955,10 @@ class Project:
         if self.prof.name == "rgb" or len(bands) == 3:
             return (0, 1, 2)
         wl = [b.wavelength_nm or 0 for b in bands]
+        if not any(wl):                          # no wavelengths: spread over the band order
+            n = len(bands)
+            return (min(n - 1, int(round(0.7 * (n - 1)))), int(round(0.45 * (n - 1))),
+                    int(round(0.2 * (n - 1))))
 
         def near(x):
             return int(np.argmin([abs(w - x) for w in wl]))
@@ -967,9 +1042,10 @@ class Project:
             m = label == fr.index
             if m.any():
                 ys, xs = np.nonzero(m)
-                cv2.putText(vis, fr.path.stem[-4:], (int(xs.mean()) - 15, int(ys.mean())),
+                tag = short_label(fr.path.stem)
+                cv2.putText(vis, tag, (int(xs.mean()) - 15, int(ys.mean())),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
-                cv2.putText(vis, fr.path.stem[-4:], (int(xs.mean()) - 15, int(ys.mean())),
+                cv2.putText(vis, tag, (int(xs.mean()) - 15, int(ys.mean())),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         cv2.imwrite(str(path), vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
@@ -1062,6 +1138,20 @@ class Project:
 
 # ---------------------------------------------------------------------- API
 
+def _block_report_rows(proj, name, results):
+    rows = []
+    for k, (comp, status) in enumerate(results, start=1):
+        files = sorted(proj.frames[i].path.name for i in comp)
+        rows.append({"block": k, "images": len(comp), "first": files[0], "last": files[-1],
+                     "output": status})
+    path = proj.out / f"{name}_blocks.csv"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
 def run(inputs, out_dir, settings: Settings | None = None, name="mosaic", render=True):
     s = settings or Settings()
     proj = Project(inputs, out_dir, s)
@@ -1076,6 +1166,8 @@ def run(inputs, out_dir, settings: Settings | None = None, name="mosaic", render
         img, _ = proj.preview_mosaic()
         cv2.imwrite(str(proj.out / f"{name}_preview.jpg"), RD.visualise(img.astype(np.float32), proj.vis_channels()))
     rep = proj.report(name)
+    if render and s.min_block > 0:
+        proj.render_blocks(name)
     proj.log(f"done: {proj.out}")
     return proj, rep
 

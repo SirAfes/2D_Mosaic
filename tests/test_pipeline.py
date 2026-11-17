@@ -144,3 +144,29 @@ def test_degenerate_frames_detected():
     assert proj.degenerate_frames() == [3, 4, 5]
     proj.result = SimpleNamespace(H={i: H[i] for i in range(3)})
     assert proj.degenerate_frames() == []
+
+
+def test_separate_groups_rendered_as_blocks(tmp_path):
+    """Two strips with no overlap (a gap in the coverage): the second one is
+    rendered on its own instead of being dropped."""
+    import csv
+    import tifffile
+    src = tmp_path / "src"
+    src.mkdir()
+    for prefix, seed in (("A", 1), ("B", 9)):
+        sub = tmp_path / prefix
+        sub.mkdir()
+        _survey(sub, n_cols=3, n_rows=1, seed=seed)
+        for f in sub.glob("*.tif"):
+            f.rename(src / f"{prefix}_{f.name}")
+    s = Settings(methods="sift", accuracy="high", resolution=0.25, distortion=False,
+                 n_features=3000, jobs=2, min_block=3)
+    proj, rep = run(src, tmp_path / "out", s)
+    assert rep["aligned_images"] == 3
+    rows = list(csv.DictReader(open(tmp_path / "out" / "mosaic_blocks.csv")))
+    assert [int(r["images"]) for r in rows] == [3, 3]
+    assert rows[1]["output"] == "mosaic_block02.tif"
+    assert {rows[0]["first"][0], rows[1]["first"][0]} == {"A", "B"}
+    out = tifffile.imread(tmp_path / "out" / "mosaic_block02.tif")
+    assert (out[..., 0] > 0).mean() > 0.3
+    assert proj.result.components[0] == sorted(proj.result.components[0])   # main result restored

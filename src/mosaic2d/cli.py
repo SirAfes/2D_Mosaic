@@ -80,6 +80,9 @@ def build_parser():
     r.add_argument("--keep-canvas", action="store_true")
     r.add_argument("--tiles", type=int, default=0, dest="tile_size",
                    help="split the output into tiles of this size (px) plus a .vrt that joins them")
+    r.add_argument("--min-block", type=int, default=5,
+                   help="also render every other group of at least this many connected images "
+                        "(gaps in the coverage) as <name>_blockNN; 0 = largest group only")
     rr = sub.add_parser("render", help="render again from a saved project (<name>_project.pkl)")
     rr.add_argument("project")
     rr.add_argument("-o", "--out", default=None)
@@ -91,6 +94,7 @@ def build_parser():
     rr.add_argument("--gsd", type=float, default=None)
     rr.add_argument("--no-deghost", dest="deghost", action="store_const", const=False, default=None)
     rr.add_argument("--no-feather", dest="feather", action="store_const", const=False, default=None)
+    rr.add_argument("--min-block", type=int, default=None)
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
@@ -120,9 +124,11 @@ def main(argv=None):
         proj = Project.load(args.project, args.out, blend=args.blend, resolution=args.resolution,
                             orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir,
                             seams=args.seams, deghost=args.deghost, gsd=args.gsd,
-                            feather=args.feather)
+                            feather=args.feather, min_block=args.min_block)
         proj.render(args.name)
         proj.report(args.name)
+        if proj.s.min_block > 0:
+            proj.render_blocks(args.name)
         return 0
     known = {f.name for f in fields(Settings)}
     s = Settings(**{k: v for k, v in vars(args).items() if k in known and v is not None})

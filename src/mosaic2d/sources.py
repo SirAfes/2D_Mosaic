@@ -111,8 +111,14 @@ def get_profile(name_or_path: str, sample_file=None) -> CameraProfile:
             raise ValueError("multiband profile needs a sample file")
         arr = rawio.read_image(sample_file)
         c = arr.shape[2] if arr.ndim == 3 else 1
-        return CameraProfile("multiband", (1, 1), None, 1.0, "bilinear",
-                             [Band(f"band {k + 1}", 1, k) for k in range(c)])
+        info = rawio.tiff_band_info(sample_file) if Path(sample_file).suffix.lower() in (".tif", ".tiff") else {}
+        bands = []
+        for k in range(c):
+            name, wl = info.get(k, (None, None))
+            if not name:
+                name = f"{wl:g} nm" if wl else f"band {k + 1}"
+            bands.append(Band(name, 1, k, wl))
+        return CameraProfile("multiband", (1, 1), None, 1.0, "bilinear", bands)
     if Path(name_or_path).is_file():
         return profile_from_json(name_or_path)
     raise ValueError(f"Unknown camera profile '{name_or_path}' (rgb, agrowing6, multiband or a JSON file)")
