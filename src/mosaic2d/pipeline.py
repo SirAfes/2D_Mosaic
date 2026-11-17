@@ -643,6 +643,21 @@ class Project:
             raise RuntimeError("No image pair could be matched")
         self.result = BA.run_bundle(nodes, corr, pairH, sizes, model=self.s.model,
                                     distortion=self.s.distortion, log=self.log)
+        bad = self.degenerate_frames()
+        if bad and self.s.model == "homography":
+            # long chains: perspective terms are weakly constrained and drift
+            # until the far frames fold over; the affine model cannot fold
+            self.log(f"  {len(bad)} frame(s) degenerate under the homography model "
+                     "(perspective drift along the chain); adjusting again with the affine model")
+            self.s.model = "affine"
+            self.result = BA.run_bundle(nodes, corr, pairH, sizes, model=self.s.model,
+                                        distortion=self.s.distortion, log=self.log)
+            bad = self.degenerate_frames()
+        if bad:
+            names = ", ".join(self.frames[i].path.name for i in bad[:12]) + (" ..." if len(bad) > 12 else "")
+            self.log(f"  {len(bad)} frame(s) left out of the mosaic (degenerate geometry): {names}")
+            for i in bad:
+                self.result.H.pop(i, None)
         r = self.result
         for rem in r.removed_pairs:
             key = (rem["i"], rem["j"])
@@ -654,6 +669,34 @@ class Project:
                  f"RMSE {r.rmse_px:.2f} px, median {r.median_px:.2f} px, "
                  f"k1={r.k[0]:+.4f} k2={r.k[1]:+.4f}, anchor {self.frames[r.anchor].path.name}")
         self.timing["adjustment_s"] = self.timing.get("adjustment_s", 0) + time.time() - t
+
+    def degenerate_frames(self, max_scale_ratio=3.0, max_aniso=3.0) -> list:
+        """Frames whose adjusted transform folds (a corner on or behind the
+        horizon), is strongly stretched, or whose scale is far from the median."""
+        r = self.result
+        scales, bad = {}, []
+        for fr in self.frames:
+            H = r.H.get(fr.index)
+            if H is None:
+                continue
+            w, h = fr.ref_size
+            cx, cy = w / 2.0, h / 2.0
+            corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1], [cx, cy, 1]], np.float64)
+            den = corners @ H[2]
+            if not np.all(np.isfinite(H)) or np.any(den * np.sign(den[-1]) <= 1e-6 * abs(den[-1])):
+                bad.append(fr.index)
+                continue
+            p = (H[:2, :2] @ [cx, cy] + H[:2, 2]) / den[-1]
+            J = (H[:2, :2] - np.outer(p, H[2, :2])) / den[-1]
+            sv = np.linalg.svd(J, compute_uv=False)
+            if sv[-1] <= 0 or sv[0] / sv[-1] > max_aniso:
+                bad.append(fr.index)
+                continue
+            scales[fr.index] = float(np.sqrt(sv[0] * sv[1]))
+        if scales:
+            med = float(np.median(list(scales.values())))
+            bad += [i for i, sc in scales.items() if sc > max_scale_ratio * med or sc < med / max_scale_ratio]
+        return sorted(bad)
 
     def estimated_pairs(self, min_overlap=0.12) -> list:
         """Pairs whose adjusted footprints overlap but were never matched."""
@@ -850,8 +893,8 @@ class Project:
         t = time.time()
         T, (W, H) = self.output_transform()
         if max(W, H) > 300000:
-            raise RuntimeError(f"Output would be {W} x {H} px - registration is probably wrong, "
-                               "or lower --resolution.")
+            raise RuntimeError(f"Output would be {W} x {H} px - registration is probably wrong "
+                               "(try --model affine), or lower --resolution.")
         frames = self.render_frames(T)
         r = self.result
         dist = RD.Distortion(r.k, r.center, r.radius)

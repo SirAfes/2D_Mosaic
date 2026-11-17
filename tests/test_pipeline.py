@@ -126,3 +126,21 @@ def test_ingest_cache_reused(tmp_path):
     p3 = Project(src, tmp_path / "out", s2)
     p3.ingest()
     assert p3.frames[0].reg.shape != p1.frames[0].reg.shape
+
+
+def test_degenerate_frames_detected():
+    """Folded (corner behind the horizon), stretched and wrongly scaled frames."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    from mosaic2d.pipeline import Project
+    proj = Project.__new__(Project)
+    proj.frames = [SimpleNamespace(index=i, ref_size=(600, 400), path=Path(f"IMG_{i}.tif")) for i in range(6)]
+    T = lambda x: np.array([[1, 0, x], [0, 1, 0], [0, 0, 1]], np.float64)
+    H = {0: T(0), 1: T(300), 2: T(600)}
+    H[3] = T(900) @ np.array([[1, 0, 0], [0, 1, 0], [-0.003, 0, 1]])    # folds inside the frame
+    H[4] = T(1200) @ np.diag([4.0, 1.0, 1.0])                            # stretched 4:1
+    H[5] = T(1500) @ np.diag([5.0, 5.0, 1.0])                            # 5x the median scale
+    proj.result = SimpleNamespace(H=H)
+    assert proj.degenerate_frames() == [3, 4, 5]
+    proj.result = SimpleNamespace(H={i: H[i] for i in range(3)})
+    assert proj.degenerate_frames() == []
