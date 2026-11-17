@@ -665,23 +665,73 @@ class Project:
         self.timing["adjustment_s"] = self.timing.get("adjustment_s", 0) + time.time() - t
 
     def _solve(self, nodes, corr, pairH, sizes, model, distortion):
-        """Bundle adjustment with a geometry check. Returns (result, model used)."""
-        r = BA.run_bundle(nodes, corr, pairH, sizes, model=model, distortion=distortion, log=self.log)
+        """
+        Bundle adjustment with a geometry check. Returns (result, model used).
+
+        Frames with degenerate transforms (folded, strongly sheared, scale far
+        from the median) are dropped. The main block is then the largest group
+        still connected through good pairs - a piece that was attached only
+        through dropped frames is split off instead of being drawn somewhere
+        beside it - and the main block is adjusted once more on its own.
+        result.components = [main] + the other groups (for render_blocks).
+        """
+        def solve(nds, mdl):
+            cs = set(nds)
+            c_sub = [c for c in corr if c.i in cs and c.j in cs]
+            p_sub = {e: H for e, H in pairH.items() if e[0] in cs and e[1] in cs}
+            return BA.run_bundle(nds, c_sub, p_sub, sizes, model=mdl, distortion=distortion, log=self.log)
+
+        r = solve(nodes, model)
         bad = self.degenerate_frames(r)
-        if bad and model == "homography":
-            # long chains: perspective terms are weakly constrained and drift
-            # until the far frames fold over; the affine model cannot fold
-            self.log(f"  {len(bad)} frame(s) degenerate under the homography model "
-                     "(perspective drift along the chain); adjusting again with the affine model")
-            model = "affine"
-            r = BA.run_bundle(nodes, corr, pairH, sizes, model=model, distortion=distortion, log=self.log)
+        if bad and model == "homography" and any(self._folds(r, i) for i in bad):
+            # long chains: perspective terms are weakly constrained and can drift
+            # until far frames fold over; the affine model cannot fold. Used only
+            # if it is clearly better.
+            ra = solve(nodes, "affine")
+            bad_a = self.degenerate_frames(ra)
+            if len(bad_a) < len(bad) and ra.median_px <= 2.0 * r.median_px:
+                self.log(f"  {len(bad)} frame(s) degenerate under the homography model; "
+                         f"the affine model is better here ({len(bad_a)} degenerate, "
+                         f"median {ra.median_px:.2f} px)")
+                r, bad, model = ra, bad_a, "affine"
+        for _ in range(2):
+            if not bad:
+                break
+            names = ", ".join(self.frames[i].path.name for i in bad[:12]) + (" ..." if len(bad) > 12 else "")
+            self.log(f"  {len(bad)} frame(s) left out of the main block (degenerate geometry): {names}")
+            removed = {(d["i"], d["j"]) for d in r.removed_pairs}
+            kept = [n for n in r.components[0] if n not in set(bad)]
+            ks = set(kept)
+            edges = [(c.i, c.j) for c in corr if c.i in ks and c.j in ks and (c.i, c.j) not in removed]
+            main = BA.connected_components(kept, edges)[0] if kept else []
+            if len(main) < 2:
+                break
+            if len(main) < len(kept):
+                self.log(f"  without them the main block splits; keeping its largest piece "
+                         f"({len(main)} images), the others become separate groups")
+            r = solve(main, model)
             bad = self.degenerate_frames(r)
         if bad:
-            names = ", ".join(self.frames[i].path.name for i in bad[:12]) + (" ..." if len(bad) > 12 else "")
-            self.log(f"  {len(bad)} frame(s) left out of the mosaic (degenerate geometry): {names}")
             for i in bad:
                 r.H.pop(i, None)
+            r.components[0] = [n for n in r.components[0] if n in r.H]
+        main = set(r.components[0])
+        rest = [n for n in nodes if n not in main]
+        rs = set(rest)
+        r.components = [sorted(main)] + BA.connected_components(
+            rest, [(c.i, c.j) for c in corr if c.i in rs and c.j in rs])
         return r, model
+
+    def _folds(self, r, i) -> bool:
+        """True if frame i's transform puts a corner on or behind the horizon."""
+        H = r.H.get(i)
+        if H is None:
+            return False
+        if not np.all(np.isfinite(H)):
+            return True
+        w, h = self.frames[i].ref_size
+        den = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1], [w / 2, h / 2, 1]], np.float64) @ H[2]
+        return bool(np.any(den * np.sign(den[-1]) <= 1e-6 * abs(den[-1])))
 
     def render_blocks(self, name="mosaic"):
         """
@@ -819,9 +869,22 @@ class Project:
 
     @classmethod
     def load(cls, path, out_dir=None, **overrides):
+        import pathlib
         import pickle
+
+        class _Unpickler(pickle.Unpickler):
+            # a project saved on Windows holds WindowsPath objects, which cannot
+            # be created on Linux/macOS (and PosixPath not on Windows)
+            def find_class(self, module, name):
+                if module.startswith("pathlib") and name in ("WindowsPath", "PosixPath"):
+                    native = type(pathlib.Path())
+                    if name == native.__name__:
+                        return native
+                    return pathlib.PureWindowsPath if name == "WindowsPath" else pathlib.PurePosixPath
+                return super().find_class(module, name)
+
         with open(path, "rb") as fh:
-            d = pickle.load(fh)
+            d = _Unpickler(fh).load()
         proj = cls.__new__(cls)
         proj.__dict__.update(d["state"])
         from dataclasses import fields as _fields

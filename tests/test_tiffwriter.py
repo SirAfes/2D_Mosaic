@@ -11,7 +11,7 @@ def test_roundtrip(tmp_path, shape, dtype, names, big):
     a = rng.integers(0, np.iinfo(dtype).max, shape, dtype=dtype)
     wl = [float(n.split()[0]) for n in names] if names else None
     p = write_tiff(tmp_path / "x.tif", a, band_names=names, wavelengths=wl, nodata=0,
-                   description="test", bigtiff=big, rows_per_strip=37)
+                   description="test", bigtiff=big, tile=64)
     with tifffile.TiffFile(p) as t:
         b = t.asarray()
         assert t.is_bigtiff == big
@@ -57,3 +57,39 @@ def test_tiled_vrt_carries_band_wavelengths_and_metadata(tmp_path):
     assert [b.find("Description").text for b in bands] == ["450 nm", "560 nm", "850 nm"]
     um = [b.find("Metadata[@domain='IMAGERY']/MDI").text for b in bands]
     assert um == ["0.4500", "0.5600", "0.8500"]
+
+
+def test_tiled_with_internal_overviews(tmp_path):
+    a = np.zeros((1000, 1500, 3), np.uint16)
+    a[100:900, 200:1300] = 4000
+    a[100:900, 200:700, 1] = 8000
+    p = write_tiff(tmp_path / "o.tif", a, nodata=0, tile=256)
+    with tifffile.TiffFile(p) as t:
+        assert t.pages[0].is_tiled and t.pages[0].tilewidth == 256
+        levels = t.series[0].levels
+        assert [lv.shape[:2] for lv in levels] == [(1000, 1500), (500, 750), (250, 375), (125, 188)]
+        assert all(t.pages[k].tags[254].value == 1 for k in range(1, 4))     # reduced-resolution
+        assert np.array_equal(levels[0].asarray(), a)
+        o1 = levels[1].asarray()
+        assert np.array_equal(o1, a[::2, ::2])                               # piecewise constant input
+        # empty areas do not darken the edge of the image in overviews
+        b = np.zeros((10, 10, 1), np.uint16)
+        b[:, :5] = 1000
+        b[:, 5] = 1000
+        from mosaic2d.tiffwriter import _downsample2
+        d = _downsample2(b)
+        assert d[0, 2] == 1000 and d[0, 3] == 0
+
+
+def test_large_overview_levels_use_disk(tmp_path, monkeypatch):
+    """Overviews bigger than the in-memory limit go to a temporary file that is removed."""
+    import mosaic2d.tiffwriter as TW
+    monkeypatch.setattr(TW, "_OVR_RAM_LIMIT", 0)
+    seen = []
+    orig = np.lib.format.open_memmap
+    monkeypatch.setattr(np.lib.format, "open_memmap", lambda *a, **k: seen.append(a[0]) or orig(*a, **k))
+    a = np.full((600, 700, 2), 7, np.uint16)
+    p = write_tiff(tmp_path / "d.tif", a, tile=128, work_dir=tmp_path)
+    assert len(seen) == 3 and not list(tmp_path.glob("m2d_ovr_*"))
+    with tifffile.TiffFile(p) as t:
+        assert np.array_equal(t.series[0].levels[1].asarray(), a[::2, ::2])

@@ -2,6 +2,15 @@
 
 ## 0.3.0
 
+- Output TIFFs are tiled (512 x 512) with internal overviews (pyramids), like Metashape
+  and GDAL exports: viewers read only the tiles on screen and use the small overviews
+  when zoomed out, instead of decoding image-wide strips and building pyramids first.
+- Main block: frames with degenerate geometry are dropped, the main mosaic keeps only
+  the largest piece still connected through good pairs (pieces that hung on through
+  dropped frames become separate groups instead of being drawn beside it), and that
+  piece is adjusted again on its own. The affine fallback is used only if it is clearly
+  better (on a 476-image RGB dive it was 3x worse and had sheared part of the mosaic).
+- Projects saved on Windows can be loaded on Linux/macOS and the other way round.
 - Gaps in the coverage: every other group of connected images (`--min-block`, default 5)
   is adjusted and rendered on its own as `<name>_blockNN`; `<name>_blocks.csv` lists all
   groups. Before, only the largest group was rendered.
@@ -9,8 +18,6 @@
   wavelengths are read from the file (GDAL metadata or msalign JSON) instead of
   "band 1 ... band N"; preview colours chosen by wavelength. `mosaic2d render` refreshes
   the names in projects saved before this change.
-- Long chains whose homographies drift until frames fold are adjusted again with the
-  affine model; frames still degenerate are left out with a warning (no more huge canvas).
 - Seam maps label frames by image number. tifffile is a regular dependency.
 - Windows executable (`mosaic2d.exe`, built by GitHub Actions on every version tag)
   with a small window: choose folders and options, follow the log, open the results.

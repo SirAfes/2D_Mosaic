@@ -95,6 +95,11 @@ def build_parser():
     rr.add_argument("--no-deghost", dest="deghost", action="store_const", const=False, default=None)
     rr.add_argument("--no-feather", dest="feather", action="store_const", const=False, default=None)
     rr.add_argument("--min-block", type=int, default=None)
+    rr.add_argument("--readjust", action="store_true",
+                    help="run the adjustment again from the matches stored in the project "
+                         "(after an update of mosaic2d), then render")
+    rr.add_argument("--model", default=None, choices=["translation", "similarity", "affine", "homography"],
+                    help="with --readjust: transform model (default homography)")
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
@@ -125,6 +130,10 @@ def main(argv=None):
                             orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir,
                             seams=args.seams, deghost=args.deghost, gsd=args.gsd,
                             feather=args.feather, min_block=args.min_block)
+        if args.readjust:
+            proj.s.model = args.model or "homography"
+            proj.adjust()
+            proj.save(Path(args.project).with_name(f"{args.name}_project.pkl"))
         proj.render(args.name)
         proj.report(args.name)
         if proj.s.min_block > 0:

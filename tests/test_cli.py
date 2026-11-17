@@ -18,3 +18,8 @@ def test_gui_builds_valid_run_arguments(tmp_path):
 def test_gui_subcommand_parses():
     args = build_parser().parse_args(["gui", "--selftest"])
     assert args.cmd == "gui" and args.selftest
+
+
+def test_render_readjust_parses():
+    args = build_parser().parse_args(["render", "p.pkl", "--readjust", "--min-block", "0"])
+    assert args.readjust and args.min_block == 0 and args.model is None
