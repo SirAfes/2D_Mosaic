@@ -29,7 +29,7 @@ Windows may warn about an unknown publisher the first time (the executable is no
 Python ≥ 3.10:
 
 ```bash
-pip install "git+https://github.com/SirAfes/mosaic2d.git"
+pip install "git+https://github.com/SirAfes/2D_Mosaic.git"
 pip install rawpy          # optional: RAW formats other than Sony ARW
 ```
 
