@@ -41,3 +41,19 @@ def test_metric_scale_tags_and_world_file(tmp_path):
         assert tags[33922].value[3:5] == (0.0, 0.025)
     tfw = (tmp_path / "s.tfw").read_text().split()
     assert float(tfw[0]) == 0.0005 and float(tfw[3]) == -0.0005
+
+
+def test_tiled_vrt_carries_band_wavelengths_and_metadata(tmp_path):
+    import xml.etree.ElementTree as ET
+    from mosaic2d.tiffwriter import write_tiled
+    a = np.full((200, 300, 3), 500, np.uint16)
+    vrt = write_tiled(tmp_path, "ms", a, band_names=["450 nm", "560 nm", "850 nm"],
+                      wavelengths=[450, 560, 850], tile=128,
+                      metadata={"PROFILE": "agrowing6", "REFERENCE_BAND": "525 nm"})
+    root = ET.parse(vrt).getroot()
+    md = {m.get("key"): m.text for m in root.find("Metadata")}
+    assert md == {"PROFILE": "agrowing6", "REFERENCE_BAND": "525 nm"}
+    bands = root.findall("VRTRasterBand")
+    assert [b.find("Description").text for b in bands] == ["450 nm", "560 nm", "850 nm"]
+    um = [b.find("Metadata[@domain='IMAGERY']/MDI").text for b in bands]
+    assert um == ["0.4500", "0.5600", "0.8500"]

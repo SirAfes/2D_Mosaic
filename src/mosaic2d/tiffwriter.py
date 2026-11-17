@@ -198,10 +198,21 @@ def write_tiled(out_dir, name, arr, band_names=None, wavelengths=None, nodata=0,
     lines = [f'<VRTDataset rasterXSize="{W}" rasterYSize="{H}">']
     if pixel_size:
         lines.append(f"  <GeoTransform>0, {pixel_size!r}, 0, {H * pixel_size!r}, 0, {-pixel_size!r}</GeoTransform>")
+    if metadata:                     # same processing information as the tiles carry
+        lines.append("  <Metadata>")
+        lines += [f'    <MDI key="{escape(str(k))}">{escape(str(v))}</MDI>' for k, v in metadata.items()]
+        lines.append("  </Metadata>")
     for b in range(C):
         lines.append(f'  <VRTRasterBand dataType="{dt}" band="{b + 1}">')
         if band_names:
             lines.append(f"    <Description>{escape(band_names[b])}</Description>")
+        if wavelengths and wavelengths[b] is not None:
+            lines += ["    <Metadata>",
+                      f'      <MDI key="wavelength">{wavelengths[b]:g}</MDI>',
+                      "    </Metadata>",
+                      '    <Metadata domain="IMAGERY">',
+                      f'      <MDI key="CENTRAL_WAVELENGTH_UM">{wavelengths[b] / 1000.0:.4f}</MDI>',
+                      "    </Metadata>"]
         lines.append(f"    <NoDataValue>{nodata}</NoDataValue>")
         lines.append(f"    <ColorInterp>{interp[b]}</ColorInterp>")
         for fn, x, y, w, h in sources:
