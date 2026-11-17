@@ -10,6 +10,7 @@ Command line interface.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -103,6 +104,8 @@ def build_parser():
 def main(argv=None):
     if argv is None and len(sys.argv) == 1 and getattr(sys, "frozen", False):
         argv = ["gui"]                       # double-clicked executable: open the window
+        if os.environ.get("MOSAIC2D_GUI_SELFTEST"):
+            argv.append("--selftest")        # CI: same start-up path, window closed at once
     args = build_parser().parse_args(argv)
     if args.cmd == "gui":
         from .gui import main as gui_main

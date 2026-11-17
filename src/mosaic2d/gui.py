@@ -207,6 +207,13 @@ def main(selftest: bool = False) -> int:
     import tkinter as tk
     root = tk.Tk()
     App(root)
+    try:                                              # bring the window in front of the console
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(800, lambda: root.attributes("-topmost", False))
+        root.focus_force()
+    except Exception:
+        pass
     if selftest:                                      # build the window once and close (CI check)
         root.update()
         root.destroy()

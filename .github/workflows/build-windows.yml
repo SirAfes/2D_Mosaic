@@ -50,6 +50,12 @@ jobs:
           & $exe --version; if ($LASTEXITCODE) { exit 1 }
           & $exe methods; if ($LASTEXITCODE) { exit 1 }
           & $exe gui --selftest; if ($LASTEXITCODE) { exit 1 }
+          # the double-click path (no arguments), window closed at once
+          $env:MOSAIC2D_GUI_SELFTEST = "1"
+          $t = Measure-Command { & $exe | Out-Host }
+          Remove-Item Env:MOSAIC2D_GUI_SELFTEST
+          if ($LASTEXITCODE) { exit 1 }
+          "double-click start-up: $([int]$t.TotalSeconds) s"
           python packaging/make_smoke_data.py smoke\src
           & $exe run smoke\src -o smoke\out --resolution 0.5 --no-cache; if ($LASTEXITCODE) { exit 1 }
           if (-not (Test-Path smoke\out\mosaic.tif)) { Write-Error "no mosaic written"; exit 1 }
