@@ -168,7 +168,7 @@ def write_tiff(path, arr, band_names=None, wavelengths=None, nodata=None, descri
                 offsets, counts = [], []
                 for y in range(0, h, tile):
                     for x in range(0, w, tile):
-                        t = np.asarray(src[y:y + tile, x:x + tile])
+                        t = np.array(src[y:y + tile, x:x + tile])     # copy: no view keeps a memmap open
                         t = t.reshape(t.shape[0], t.shape[1], C)
                         data = _encode_tile(t, tile, dtype, level)
                         offsets.append(fh.tell())
@@ -182,9 +182,10 @@ def write_tiff(path, arr, band_names=None, wavelengths=None, nodata=None, descri
                         if progress and done % 200 == 0:
                             progress(done / total_tiles)
                 levels_data.append((offsets, counts))
-                if k > 0:
-                    del src
+                if isinstance(nxt, np.memmap):
+                    nxt.flush()
                 src = nxt
+            src = nxt = t = None
 
             rgb = C == 3 and not band_names_is_ms(band_names)
             n_extra = 0 if rgb else C - 1
@@ -225,6 +226,9 @@ def write_tiff(path, arr, band_names=None, wavelengths=None, nodata=None, descri
                 prev_next = nxt_field
     finally:
         if tmp is not None:
+            import gc
+            src = nxt = None                     # Windows cannot delete a file that is still mapped
+            gc.collect()
             shutil.rmtree(tmp, ignore_errors=True)
     if progress:
         progress(1.0)
