@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-MODELS = ("translation", "similarity", "affine", "homography")
+MODELS = ("translation", "rigid", "similarity", "affine", "homography")
 
 
 def _basis(model: str):
@@ -45,7 +45,7 @@ def _basis(model: str):
         c[0] = c[4] = 1.0
         M = np.zeros((9, 2))
         M[2, 0] = M[5, 1] = 1
-    elif model == "similarity":
+    elif model in ("similarity", "rigid"):      # rigid = similarity with the scale tied to 1
         M = np.zeros((9, 4))
         M[0, 0] = M[4, 0] = 1     # a
         M[1, 1], M[3, 1] = -1, 1  # b
@@ -74,8 +74,11 @@ def project_to_model(H: np.ndarray, model: str, size) -> np.ndarray:
     dst = cv2.perspectiveTransform(src[None], H)[0]
     if model == "affine":
         A, _ = cv2.estimateAffine2D(src, dst, method=cv2.LMEDS)
-    elif model == "similarity":
+    elif model in ("similarity", "rigid"):
         A, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)
+        if model == "rigid":
+            sc = float(np.hypot(A[0, 0], A[1, 0])) or 1.0
+            A[:, :2] /= sc
     else:
         t = (dst - src).mean(0)
         A = np.array([[1, 0, t[0]], [0, 1, t[1]]], np.float64)
@@ -214,6 +217,9 @@ class BundleAdjuster:
         self.robust_px = robust_px
         self.max_corr = max_corr_per_pair
         self.persp_prior = perspective_prior
+        # rigid: same camera at the same height -> every frame keeps the scale of
+        # the anchor (strong prior on |(a, b)| = 1; residuals are in normalised units)
+        self.scale_prior = 1e3 if model == "rigid" else 0.0
         self.log = verbose or (lambda *a: None)
 
     # ------------------------------------------------------------ core LM
@@ -356,22 +362,34 @@ class BundleAdjuster:
         return Hs, k, it
 
     def _prior_cost(self, x, idx_of, nk):
-        if self.model != "homography" or not self.persp_prior:
-            return 0.0
         tot = 0.0
-        for off in idx_of.values():
-            if off is not None:
-                tot += 0.5 * self.persp_prior * (x[off + 6] ** 2 + x[off + 7] ** 2)
+        if self.model == "homography" and self.persp_prior:
+            for off in idx_of.values():
+                if off is not None:
+                    tot += 0.5 * self.persp_prior * (x[off + 6] ** 2 + x[off + 7] ** 2)
+        if self.scale_prior:
+            for off in idx_of.values():
+                if off is not None:
+                    tot += 0.5 * self.scale_prior * (np.hypot(x[off], x[off + 1]) - 1.0) ** 2
         return tot
 
     def _add_prior(self, A, g, x, idx_of, nk):
-        if self.model != "homography" or not self.persp_prior:
-            return
-        for off in idx_of.values():
-            if off is not None:
-                for t in (6, 7):
-                    A[off + t, off + t] += self.persp_prior
-                    g[off + t] += self.persp_prior * x[off + t]
+        if self.model == "homography" and self.persp_prior:
+            for off in idx_of.values():
+                if off is not None:
+                    for t in (6, 7):
+                        A[off + t, off + t] += self.persp_prior
+                        g[off + t] += self.persp_prior * x[off + t]
+        if self.scale_prior:
+            lam = self.scale_prior
+            for off in idx_of.values():
+                if off is None:
+                    continue
+                a, b = x[off], x[off + 1]
+                sc = max(np.hypot(a, b), 1e-9)
+                J = np.array([a / sc, b / sc])
+                A[off:off + 2, off:off + 2] += lam * np.outer(J, J)
+                g[off:off + 2] += lam * (sc - 1.0) * J
 
     # ------------------------------------------------------------ evaluation
     def residuals_px(self, Hs, k, corr) -> list[np.ndarray]:

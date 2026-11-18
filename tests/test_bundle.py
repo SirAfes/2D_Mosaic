@@ -67,3 +67,30 @@ def test_bundle_estimates_radial_distortion():
     assert abs(r.k[0] - (-0.06)) < 0.01, r.k
     assert r.median_px < 1.0
     assert _err(Hs, r.H, sizes) < 4.0
+
+
+def test_rigid_model_keeps_every_frame_at_the_same_scale():
+    """A chain whose pairwise estimates carry small scale errors: homography /
+    similarity let the scale drift along the chain, rigid keeps it at 1."""
+    from mosaic2d import bundle as BA
+    rng = np.random.default_rng(3)
+    n, size = 12, (600, 400)
+    true = {k: np.array([[1, 0, 300.0 * k], [0, 1, 0], [0, 0, 1]]) for k in range(n)}
+    corr, pairH = [], {}
+    for k in range(n - 1):
+        i, j = k, k + 1
+        P = np.column_stack([rng.uniform(320, 600, 200), rng.uniform(0, 400, 200)])
+        Hij = np.linalg.inv(true[j]) @ true[i]
+        bias = np.diag([1.02, 1.02, 1.0])                   # consistent 2 % scale error per link
+        Q = cv2.perspectiveTransform(P[None], bias @ Hij)[0]
+        corr.append(BA.Correspondences(i, j, P, Q))
+        pairH[(i, j)] = bias @ Hij
+    sizes = {k: size for k in range(n)}
+
+    def spread(model):
+        r = BA.run_bundle(list(range(n)), corr, pairH, sizes, model=model, distortion=False,
+                          log=lambda *a: None)
+        sc = [np.sqrt(abs(np.linalg.det(r.H[k][:2, :2]))) for k in range(n)]
+        return max(sc) / min(sc)
+    assert spread("similarity") > 1.15                      # drift accumulates
+    assert spread("rigid") < 1.01

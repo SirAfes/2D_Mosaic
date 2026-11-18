@@ -31,7 +31,9 @@ def _add_common(p: argparse.ArgumentParser):
                    help="cascade: per pair, next method only if the previous failed; "
                         "union: pool matches of all methods; single: first method only")
     p.add_argument("--model", default="homography",
-                   choices=["translation", "similarity", "affine", "homography"])
+                   choices=["translation", "rigid", "similarity", "affine", "homography"],
+                   help="rigid: rotation + shift, every photo at the same scale (same camera and height); "
+                        "homography: free scale and perspective per photo")
     p.add_argument("--accuracy", default="medium", choices=list(ACCURACY),
                    help="working resolution for matching (like Metashape's alignment accuracy)")
     p.add_argument("--features", type=int, default=8000, dest="n_features", help="key point limit per image")
@@ -98,7 +100,7 @@ def build_parser():
     rr.add_argument("--readjust", action="store_true",
                     help="run the adjustment again from the matches stored in the project "
                          "(after an update of mosaic2d), then render")
-    rr.add_argument("--model", default=None, choices=["translation", "similarity", "affine", "homography"],
+    rr.add_argument("--model", default=None, choices=["translation", "rigid", "similarity", "affine", "homography"],
                     help="with --readjust: transform model (default homography)")
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
