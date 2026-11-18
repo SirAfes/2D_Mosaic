@@ -38,8 +38,10 @@ import numpy as np
 from . import __version__
 from . import bands as BD
 from . import bundle as BA
+from . import camera as CAM
 from . import features as FT
 from . import matching as MT
+from . import rawio
 from . import render as RD
 from . import sources as SR
 from .tiffwriter import write_tiff, write_tiled
@@ -53,7 +55,11 @@ class Settings:
     methods: str = "auto"            # auto | comma list (see `mosaic2d methods`)
     strategy: str = "cascade"        # cascade | union | single
     cascade_limit: int = 4           # max. methods tried per pair (cascade)
-    model: str = "homography"        # translation | similarity | affine | homography
+    model: str = "camera"            # camera (photos over a plane) | homography | affine | similarity | rigid | translation
+    focal_px: float | None = None    # nominal focal length in native px (default: EXIF / camera profile)
+    height_m: float | None = None    # typical camera-to-ground distance (m) -> metric pixel size
+    height_sigma: float = 0.1        # camera model: heights within ~ +-10 % unless the tie points say otherwise
+    tilt_sigma: float = 15.0         # camera model: tilt from nadir (deg), prior width
     accuracy: str = "medium"         # working resolution for matching (max side px)
     n_features: int = 8000
     preselection: str = "auto"       # auto | sequential | generic | exhaustive
@@ -664,7 +670,7 @@ class Project:
                  f"k1={r.k[0]:+.4f} k2={r.k[1]:+.4f}, anchor {self.frames[r.anchor].path.name}")
         self.timing["adjustment_s"] = self.timing.get("adjustment_s", 0) + time.time() - t
 
-    def _solve(self, nodes, corr, pairH, sizes, model, distortion):
+    def _solve(self, nodes, corr, pairH, sizes, model, distortion, lens=None):
         """
         Bundle adjustment with a geometry check. Returns (result, model used).
 
@@ -679,9 +685,29 @@ class Project:
             cs = set(nds)
             c_sub = [c for c in corr if c.i in cs and c.j in cs]
             p_sub = {e: H for e, H in pairH.items() if e[0] in cs and e[1] in cs}
+            if mdl == "camera":
+                f0, fsig, src = self.nominal_focal()
+                kw = {}
+                if lens is not None:                # a separate group: same lens as the main block
+                    f0, fsig = lens["focal_px"], 0.02
+                    kw = {"k_init": lens["k"], "k_sigma": 0.005}
+                return CAM.run_camera_bundle(nds, c_sub, p_sub, sizes, f0, focal_sigma=fsig,
+                                             distortion=distortion, height_sigma=self.s.height_sigma,
+                                             tilt_sigma_deg=self.s.tilt_sigma, log=self.log, **kw)
             return BA.run_bundle(nds, c_sub, p_sub, sizes, model=mdl, distortion=distortion, log=self.log)
 
-        r = solve(nodes, model)
+        if model == "camera" and lens is None:
+            f0, fsig, src = self.nominal_focal()
+            self.log(f"  camera model: photos over one plane, shared lens f = {f0:.0f} px ({src}), "
+                     f"heights +-{self.s.height_sigma:.0%}, tilt prior {self.s.tilt_sigma:g} deg")
+        try:
+            r = solve(nodes, model)
+        except Exception as e:                  # never leave the user without a mosaic
+            if model != "camera":
+                raise
+            self.log(f"  camera adjustment failed ({e}); using the homography model")
+            model = "homography"
+            r = solve(nodes, model)
         bad = self.degenerate_frames(r)
         if bad and model == "homography" and any(self._folds(r, i) for i in bad):
             # long chains: perspective terms are weakly constrained and can drift
@@ -763,8 +789,11 @@ class Project:
                 self.log(f"block {k}: {len(comp)} images ({self.frames[comp[0]].path.name} ...)")
                 try:
                     # few images cannot constrain lens distortion reliably
+                    cam = getattr(main_result, "camera", None)
+                    lens = {"focal_px": cam["focal_px"], "k": main_result.k} if cam else None
                     self.result, _ = self._solve(comp, c_sub, p_sub, sizes, model0,
-                                                 self.s.distortion and len(comp) >= 15)
+                                                 self.s.distortion and (len(comp) >= 15 or lens is not None),
+                                                 lens=lens)
                     self.render(bname)
                     results.append((comp, f"{bname}.tif"))
                 except Exception as e:            # one bad group must not stop the others
@@ -779,6 +808,40 @@ class Project:
         path = _block_report_rows(self, name, results)
         self.log(f"  groups listed in {path.name}")
         return results
+
+    def ground_pixel(self):
+        """Metres per native pixel of the median frame: --gsd, or --height / focal length."""
+        if getattr(self.s, "gsd", None):
+            return float(self.s.gsd)
+        hm = getattr(self.s, "height_m", None)
+        if hm:
+            cam = getattr(self.result, "camera", None) if getattr(self, "result", None) else None
+            f = cam["focal_px"] if cam else self.nominal_focal()[0]
+            return float(hm) / f
+        return None
+
+    def nominal_focal(self):
+        """(focal length in native px of the reference image, prior width, source)."""
+        if self.s.focal_px:
+            return float(self.s.focal_px), 0.05, "given"
+        fr = self.frames[0]
+        w, h = fr.ref_size
+        prof = self.prof
+        if prof.multilens and prof.focal_mm and prof.pixel_um and prof.cell_size:
+            cell = max(w, h) / max(prof.crop_frac, 1e-6)       # whole cell at the working resolution
+            return prof.focal_mm / (prof.pixel_um * 1e-3) * cell / prof.cell_size, 0.3, \
+                f"{prof.name} lens {prof.focal_mm:g} mm"
+        if fr.path.suffix.lower() in (".tif", ".tiff"):
+            cam = rawio.tiff_camera_info(fr.path) if Path(str(fr.path)).exists() else {}
+            fmm = cam.get("focal_length_mm")
+            pum = cam.get("pixel_size_um_output") or cam.get("pixel_size_um")
+            if fmm and pum:
+                return float(fmm) / (float(pum) * 1e-3), 0.3, f"{fmm:g} mm / {pum:g} um (file metadata)"
+        ex = fr.exif or {}
+        f35 = ex.get("focal_length_35mm")
+        if f35 and not prof.multilens:
+            return float(f35) / 36.0 * max(w, h), 0.3, f"EXIF {f35:g} mm (35 mm equiv.)"
+        return 1.2 * max(w, h), 0.6, "unknown, estimated"
 
     def degenerate_frames(self, r=None, max_scale_ratio=3.0, max_aniso=3.0) -> list:
         """Frames whose adjusted transform folds (a corner on or behind the
@@ -900,6 +963,11 @@ class Project:
         proj.log = Log(proj.out / "mosaic2d_render.log")
         proj.feats = {}
         proj.registry = FT.build_registry(proj.s.n_features)
+        if proj.prof.name in ("rgb", "agrowing6"):  # fields added after the project was saved
+            cur = SR.get_profile(proj.prof.name)
+            for fld in ("focal_mm", "pixel_um"):
+                if getattr(proj.prof, fld, None) is None and getattr(cur, fld, None) is not None:
+                    setattr(proj.prof, fld, getattr(cur, fld))
         if proj.prof.name == "multiband" and all(b.name.startswith("band ") for b in proj.prof.bands):
             try:                                   # projects from before band metadata was read
                 prof = SR.get_profile("multiband", proj.files[0])
@@ -1058,7 +1126,7 @@ class Project:
                 "REFERENCE_BAND": self.ref_band.name if self.ref_band else "luminance"}
         names_ = [b.name for b in bands]
         wls = [b.wavelength_nm for b in bands]
-        ps = (self.s.gsd / self.s.resolution) if getattr(self.s, "gsd", None) else None
+        ps = (self.ground_pixel() / self.s.resolution) if self.ground_pixel() else None
         if ps:
             meta["PIXEL_SIZE_M"] = ps
             self.log(f"  output pixel size {ps * 1000:.3f} mm ({W * ps:.2f} x {H * ps:.2f} m)")
@@ -1144,6 +1212,16 @@ class Project:
             "image_quality": {f.path.name: round(f.quality, 3) for f in self.frames},
             "timing_s": {k: round(v, 1) for k, v in self.timing.items()},
         }
+        cam = getattr(r, "camera", None) if r else None
+        if cam:
+            hr = np.array(list(cam["height_rel"].values()))
+            tl = np.array(list(cam["tilt_deg"].values()))
+            rep["camera"] = {"focal_px": round(cam["focal_px"], 1),
+                             "focal_nominal_px": round(cam["focal_nominal_px"], 1),
+                             "height_rel_min_median_max": [round(float(x), 3) for x in
+                                                           (hr.min(), np.median(hr), hr.max())],
+                             "tilt_deg_median_max": [round(float(np.median(tl)), 2), round(float(tl.max()), 2)],
+                             "ground_pixel_m": self.ground_pixel()}
         (self.out / f"{name}_report.json").write_text(json.dumps(rep, indent=2, default=str))
         with open(self.out / f"{name}_pairs.csv", "w", newline="") as fh:
             w = csv.writer(fh)
@@ -1158,7 +1236,7 @@ class Project:
                             "|".join(p.tried), p.reason])
         with open(self.out / f"{name}_images.csv", "w", newline="") as fh:
             w = csv.writer(fh)
-            hdr = ["image", "aligned", "pairs", "rmse_px", "quality", "time"]
+            hdr = ["image", "aligned", "pairs", "rmse_px", "quality", "time", "height_rel", "tilt_deg"]
             if self.prof.multilens:
                 hdr += [f"lens{ln}_{k}" for ln in range(1, self.prof.n_lenses + 1) for k in ("dx", "dy", "ncc", "method")]
             w.writerow(hdr)
@@ -1167,6 +1245,8 @@ class Project:
                 row = [fr.path.name, int(fr.index in main), pi.get("pairs", 0),
                        f"{pi['rmse_px']:.3f}" if pi.get("rmse_px") is not None else "",
                        f"{fr.quality:.2f}", fr.exif.get("datetime_original", "")]
+                row += [f"{cam['height_rel'][fr.index]:.4f}", f"{cam['tilt_deg'][fr.index]:.2f}"] \
+                    if cam and fr.index in cam["height_rel"] else ["", ""]
                 if self.prof.multilens:
                     for ln in range(1, self.prof.n_lenses + 1):
                         if ln == fr.lens.ref_lens:
@@ -1189,6 +1269,12 @@ class Project:
                  f"- Reprojection error: RMSE {rep['reprojection_rmse_px']:.2f} px, "
                  f"median {rep['reprojection_median_px']:.2f} px (native px of the reference lens)",
                  f"- Radial distortion k1, k2: {np.round(rep['distortion_k1_k2'], 5).tolist()}",
+                 *([f"- Camera model: focal {rep['camera']['focal_px']:.0f} px (nominal "
+                    f"{rep['camera']['focal_nominal_px']:.0f}), height min/median/max "
+                    f"{rep['camera']['height_rel_min_median_max']} x typical, tilt median/max "
+                    f"{rep['camera']['tilt_deg_median_max']} deg"
+                    + (f", ground pixel {rep['camera']['ground_pixel_m'] * 1000:.3f} mm at resolution 1"
+                       if rep['camera']['ground_pixel_m'] else "")] if rep.get("camera") else []),
                  f"- Canvas: {rep['canvas_px']}", f"- Timing (s): {rep['timing_s']}"]
         if rep["not_aligned"]:
             lines.append(f"- **Not aligned:** {', '.join(rep['not_aligned'])}")

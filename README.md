@@ -9,7 +9,8 @@ photos (RAW / JPG / TIFF)
    ↓ features: SIFT · RootSIFT · AKAZE · ORB · BRISK · KAZE · FAST · GFTT · BEBLID …
    ↓ pair preselection: sequential + generic (thumbnails) + estimated (footprints)
    ↓ matching: ratio test → MAGSAC++ homography → guided matching → quality checks
-   ↓ global bundle adjustment (+ radial distortion self-calibration, outlier rounds)
+   ↓ camera adjustment: every photo is a camera over one plane with a shared lens
+     (position, height, heading, tilt; focal length and distortion self-calibrated, outlier rounds)
    ↓ image quality from overlaps · flat field (vignetting) from the whole series
    ↓ seamlines: graph cut + removal of moving objects (rope, fish)
    ↓ blending (mosaic / average / disabled), out-of-core rendering
@@ -56,7 +57,10 @@ Important options (`mosaic2d run -h` lists all):
 |---|---|---|
 | `--methods` | all available | methods in cascade order, e.g. `sift,akaze,orb,fast` |
 | `--strategy` | `cascade` | `cascade`: next method only if the previous failed for that pair; `union`: pool matches of all methods; `single` |
-| `--model` | `homography` | per-image transform: `translation`, `similarity`, `affine`, `homography` |
+| `--model` | `camera` | `camera`: photos as cameras over one plane with a shared lens (see *How it works*); `homography`, `affine`, `similarity`, `rigid`, `translation`: free 2D transforms |
+| `--height` | — | typical camera-to-ground distance in metres → pixel size in metres |
+| `--focal-px` | EXIF | focal length in pixels, if the EXIF / camera profile value is missing or wrong |
+| `--height-sigma` | 0.1 | how much the camera height may vary (camera model) |
 | `--accuracy` | `medium` | matching resolution (max. side 6000/3600/2400/1200/700 px for highest…lowest) |
 | `--preselection` | `auto` | `auto` = sequential + generic + estimated; or `sequential`, `generic`, `exhaustive` |
 | `--blend` | `mosaic` | `mosaic` (two-band), `average` (feathered), `disabled` (no radiometric change) |
@@ -98,7 +102,11 @@ Band names and wavelengths are written to GDAL metadata, so QGIS shows "405 nm" 
 
 **Pair preselection.** Neighbours in capture order, plus "generic" preselection (all pairs matched on small thumbnails — finds overlaps between survey lanes), plus "estimated" preselection after a first adjustment (pairs whose footprints overlap). Images left outside the main block get a further attempt.
 
-**Bundle adjustment.** All transforms are optimised together (Levenberg–Marquardt, Cauchy loss), minimising reprojection error in the pixels of the target image. A radial distortion (k1, k2) shared by all images is estimated with them — important for wide lenses and flat-port underwater housings. Pairs and points inconsistent with the solution are removed and the adjustment repeated (like gradual selection).
+**Camera adjustment (default `--model camera`).** Like Metashape, every photo is a real camera: a position over the ground plane, a height, a heading and two tilt angles, and all photos share one lens (focal length and radial distortion k1, k2, refined from the EXIF / camera-profile value). A photo's mosaic transform is the homography the plane induces, so a photo can appear larger only through a real change of height, and it cannot shear or fold. Soft priors say "heights similar" (`--height-sigma`, default ±10 %) and "close to nadir" (15°); each is weighted like one pixel of error over all of a photo's tie points, so it only decides what the tie points cannot. All poses are optimised together (Levenberg–Marquardt, Cauchy loss) on the tie points cast through the plane into the other photo; pairs and points inconsistent with the solution are removed and the adjustment repeated (like gradual selection). Unlike Metashape there is no surface model: the scene is one plane, so the mosaic contains no extra estimate (DEM errors), and relief shows as parallax.
+
+Why not free 2D transforms: a homography per photo has 8 parameters with no physical meaning. Along a long transect small errors in them pile up as scale drift (photos at one end several times larger than at the other), shear and folding. On a 476-photo dive the camera model kept all 301 connected photos in one continuous mosaic with a straight transect tape, where homographies split it into a sheared piece and a separate one; on synthetic strips the scale error is 0.7–1.5 % against 6–22 % for homographies. It also finds the lens: underwater with a flat port it estimated 1.31–1.34 × the EXIF focal length, the refraction factor of water. `--model homography` (and affine, similarity, rigid, translation) remain available.
+
+**Scale.** Without GPS the mosaic is in pixels of the median photo. `--height 1.5` (the typical camera-to-ground distance in metres) writes the pixel size in metres (height / focal length) into the GeoTIFF tags and a `.tfw`; `--gsd` sets it directly.
 
 **Image quality.** Blur (motion, defocus close to rocks) is measured where frames overlap: each accepted pair is compared on its common area only, in both directions, and the log ratios are solved for one sharpness per frame. Scene content (smooth rock vs. textured sand) therefore does not count as blur. The comparison uses log-intensity images, so a hazy frame (an out-of-focus rope or hand in front of the lens) is not made to look detailed by contrast equalisation. Blurred and hazy frames give way to sharper overlapping frames.
 
@@ -114,7 +122,7 @@ On an underwater RGB survey (57 × 61 MP Sony ARW) every method aligned all imag
 
 ## Limits
 
-A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax that no planar transform can remove — seams are placed near frame centres to keep it small; for true orthomosaics of rough terrain use SfM software with a dense surface model. Moving objects are removed only where at least three frames see the area and another frame shows it consistently; an object present in most frames stays. A veil or halo that every overlapping frame shows in the same place (for example at the edge of the survey, where few frames overlap) cannot be replaced and stays. The geometry is relative: `--gsd` gives a metric scale but no georeferencing.
+A 2D mosaic models the scene as a plane. Relief (rocks, plants) causes parallax that no planar transform can remove — seams are placed near frame centres to keep it small; for true orthomosaics of rough terrain use SfM software with a dense surface model. Moving objects are removed only where at least three frames see the area and another frame shows it consistently; an object present in most frames stays. A veil or halo that every overlapping frame shows in the same place (for example at the edge of the survey, where few frames overlap) cannot be replaced and stays. The geometry is relative: `--height` or `--gsd` give a metric scale but no georeferencing. The camera model assumes one ground plane; strong relief over the survey (a reef wall next to sand) bends it and shows as larger residuals in the report.
 
 ## Development
 

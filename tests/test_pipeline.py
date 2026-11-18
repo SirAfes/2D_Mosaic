@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from mosaic2d import rawio
+from mosaic2d import camera as CAM
 from mosaic2d.pipeline import Settings, local_scale, run
 
 
@@ -32,9 +33,12 @@ def _survey(tmp_path, n_cols=4, n_rows=2, w=900, h=600, seed=1):
             x, y = 250 + c * 600, 250 + r * 420
             a = np.deg2rad(rng.normal(0, 3))
             s = 1 + rng.normal(0, 0.03)
-            # camera -> world
-            H = np.array([[s * np.cos(a), -s * np.sin(a), x], [s * np.sin(a), s * np.cos(a), y], [0, 0, 1]])
-            H[2, :2] = rng.normal(0, 1.5e-5, 2)
+            # a real camera over the textured plane (focal 1100 px, height s, small tilt);
+            # image -> world: the homography the plane induces
+            f = 1100.0
+            tilt = np.deg2rad(rng.normal(0, 1.0, 2))
+            Hc = CAM.image_to_plane([0.0, 0.0, np.log(s * f), tilt[0], tilt[1], -a], f, (w / 2, h / 2))
+            H = np.array([[1, 0, x + s * w / 2], [0, 1, y + s * h / 2], [0, 0, 1]]) @ Hc
             img = cv2.warpPerspective(world, np.linalg.inv(H), (w, h), flags=cv2.INTER_LINEAR)
             img = img.astype(np.float32) * np.float32(1 - 0.25 * ((np.linspace(-1, 1, w)[None] ** 2
                                                                 + np.linspace(-1, 1, h)[:, None] ** 2) / 2))[..., None]
@@ -62,14 +66,15 @@ def test_synthetic_survey(tmp_path, blend):
     Ha_true = truth[names[a]]
     errs = []
     for f in proj.frames:
-        rel_true = np.linalg.inv(Ha_true) @ truth[f.path.name]   # image -> anchor
-        rel_est = proj.result.H[f.index]
+        rel_true = np.linalg.inv(Ha_true) @ truth[f.path.name]   # image -> anchor image
+        rel_est = np.linalg.inv(proj.result.H[a]) @ proj.result.H[f.index]
         c = np.array([[[450.0, 300.0], [0, 0], [900, 600]]])
         errs.append(np.abs(cv2.perspectiveTransform(c, rel_true) - cv2.perspectiveTransform(c, rel_est)).max())
     assert max(errs) < 3.0, errs
     # output scale refers to the median frame, whichever frame is the anchor
     s_true = np.median([local_scale(np.linalg.inv(Ha_true) @ truth[n], 450, 300) for n in names])
-    assert abs(proj.median_frame_scale() / s_true - 1) < 0.01
+    s_anchor = local_scale(proj.result.H[a], 450, 300)
+    assert abs(proj.median_frame_scale() / s_anchor / s_true - 1) < 0.01
     out = tmp_path / "out" / "mosaic.tif"
     assert out.is_file()
     img = rawio.read_image(out)

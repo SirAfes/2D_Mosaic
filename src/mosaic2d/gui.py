@@ -36,9 +36,11 @@ class _QueueWriter:
         pass
 
 
-def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic"):
+def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", height=None):
     argv = ["run", str(inp), "--resolution", str(resolution), "--profile", profile,
             "--accuracy", accuracy, "--name", name]
+    if height:
+        argv += ["--height", str(height)]
     if out:
         argv += ["-o", str(out)]
     if tiles:
@@ -66,6 +68,7 @@ class App:
         self.v_prof = tk.StringVar(value="auto")
         self.v_acc = tk.StringVar(value="medium")
         self.v_tiles = tk.BooleanVar(value=False)
+        self.v_height = tk.StringVar(value="")
         self.v_status = tk.StringVar(value="Choose the folder with the photos.")
 
         f = ttk.Frame(root, padding=10)
@@ -91,6 +94,8 @@ class App:
                 ttk.Entry(opts, textvariable=var, width=width).pack(side="left", padx=(0, 12))
             else:
                 ttk.Combobox(opts, textvariable=var, values=values, width=width).pack(side="left", padx=(0, 12))
+        ttk.Label(opts, text="Height (m)").pack(side="left", padx=(0, 4))
+        ttk.Entry(opts, textvariable=self.v_height, width=6).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts, text="8192 px tiles + .vrt", variable=self.v_tiles).pack(side="left")
         r += 1
         bar = ttk.Frame(f)
@@ -139,10 +144,19 @@ class App:
         except (ValueError, AssertionError):
             messagebox.showerror("mosaic2d", "Resolution must be a number such as 1.0 or 0.5.")
             return
+        height = None
+        if self.v_height.get().strip():
+            try:
+                height = float(self.v_height.get().replace(",", "."))
+                assert height > 0
+            except (ValueError, AssertionError):
+                messagebox.showerror("mosaic2d", "Height must be the camera-to-ground distance in metres, "
+                                                 "e.g. 1.5 (or leave it empty).")
+                return
         out = self.v_out.get().strip() or str(Path(inp) / "mosaic2d")
         self.out_dir = Path(out)
         argv = build_argv(inp, out, res, self.v_prof.get(), self.v_acc.get(), self.v_tiles.get(),
-                          self.v_name.get().strip() or "mosaic")
+                          self.v_name.get().strip() or "mosaic", height)
         self.log.delete("1.0", "end")
         self.q.put("mosaic2d " + " ".join(argv) + "\n\n")
         self.b_run.configure(state="disabled")

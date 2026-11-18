@@ -2,6 +2,17 @@
 
 ## 0.3.0
 
+- New default adjustment, `--model camera`: every photo is a camera over one ground plane
+  with a shared lens (position, height, heading, two tilts per photo; focal length and
+  radial distortion refined from EXIF / profile), soft priors for similar height and
+  near-nadir view. Photos can no longer change size along the survey without a real
+  change of height, shear or fold. 476-photo RGB dive: one continuous mosaic of all 301
+  connected photos with a straight transect tape (homographies: two pieces, one sheared);
+  synthetic strips: scale error 0.7-1.5 % vs 6-22 %. Estimated focal length 1.31-1.34 x
+  EXIF underwater (flat-port refraction). Separate groups reuse the main block's lens.
+- `--height` (m): metric pixel size from camera height / focal length; also in the window.
+  `--focal-px`, `--height-sigma`. Report and images.csv list focal length, heights, tilts.
+- Agrowing profile carries the lens focal length (21.8 mm, 3.76 um pixels).
 - Output TIFFs are tiled (512 x 512) with internal overviews (pyramids), like Metashape
   and GDAL exports: viewers read only the tiles on screen and use the small overviews
   when zoomed out, instead of decoding image-wide strips and building pyramids first.

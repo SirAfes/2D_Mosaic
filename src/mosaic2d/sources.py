@@ -49,6 +49,8 @@ class CameraProfile:
     crop_frac: float = 1.0          # centred part of each cell that is kept
     demosaic: str = "bilinear"      # for RAW input
     bands: list = field(default_factory=list)
+    focal_mm: float | None = None   # lens focal length (multi-lens cameras without EXIF focal)
+    pixel_um: float | None = None   # sensor pixel pitch at cell_size
 
     @property
     def n_lenses(self) -> int:
@@ -79,7 +81,8 @@ def _agrowing6() -> CameraProfile:
         (6, 0, 685), (6, 1, 560), (6, 2, 450),
     ]
     bands = [Band(f"{w} nm", lens, ch, float(w)) for lens, ch, w in table]
-    return CameraProfile("agrowing6", (3, 2), 3168, 0.80, "superpixel", bands)
+    return CameraProfile("agrowing6", (3, 2), 3168, 0.80, "superpixel", bands,
+                         focal_mm=21.8, pixel_um=3.76)
 
 
 def _rgb() -> CameraProfile:

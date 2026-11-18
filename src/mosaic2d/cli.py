@@ -30,10 +30,17 @@ def _add_common(p: argparse.ArgumentParser):
     p.add_argument("--strategy", default="cascade", choices=["cascade", "union", "single"],
                    help="cascade: per pair, next method only if the previous failed; "
                         "union: pool matches of all methods; single: first method only")
-    p.add_argument("--model", default="homography",
-                   choices=["translation", "rigid", "similarity", "affine", "homography"],
-                   help="rigid: rotation + shift, every photo at the same scale (same camera and height); "
-                        "homography: free scale and perspective per photo")
+    p.add_argument("--model", default="camera",
+                   choices=["camera", "homography", "affine", "similarity", "rigid", "translation"],
+                   help="camera: every photo is a camera over one plane with a shared lens "
+                        "(position, height, heading, tilt; like Metashape's camera model, no DEM); "
+                        "homography: free 2D transform per photo (can drift along long chains)")
+    p.add_argument("--focal-px", type=float, default=None,
+                   help="focal length in px of the photos (default: EXIF / camera profile)")
+    p.add_argument("--height", type=float, default=None, dest="height_m",
+                   help="typical camera-to-ground distance in metres: output pixel size in metres")
+    p.add_argument("--height-sigma", type=float, default=0.1,
+                   help="camera model: how much the height may vary (0.1 = about +-10 %%)")
     p.add_argument("--accuracy", default="medium", choices=list(ACCURACY),
                    help="working resolution for matching (like Metashape's alignment accuracy)")
     p.add_argument("--features", type=int, default=8000, dest="n_features", help="key point limit per image")
@@ -100,8 +107,8 @@ def build_parser():
     rr.add_argument("--readjust", action="store_true",
                     help="run the adjustment again from the matches stored in the project "
                          "(after an update of mosaic2d), then render")
-    rr.add_argument("--model", default=None, choices=["translation", "rigid", "similarity", "affine", "homography"],
-                    help="with --readjust: transform model (default homography)")
+    rr.add_argument("--model", default=None, choices=["camera", "homography", "affine", "similarity", "rigid", "translation"],
+                    help="with --readjust: transform model (default camera)")
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
@@ -133,7 +140,7 @@ def main(argv=None):
                             seams=args.seams, deghost=args.deghost, gsd=args.gsd,
                             feather=args.feather, min_block=args.min_block)
         if args.readjust:
-            proj.s.model = args.model or "homography"
+            proj.s.model = args.model or "camera"
             proj.adjust()
             proj.save(Path(args.project).with_name(f"{args.name}_project.pkl"))
         proj.render(args.name)

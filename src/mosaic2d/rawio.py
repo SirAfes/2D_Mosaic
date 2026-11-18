@@ -181,6 +181,20 @@ def tiff_band_info(path) -> dict:
     return {k: (names.get(k), wls.get(k)) for k in sorted(set(names) | set(wls))}
 
 
+def tiff_camera_info(path) -> dict:
+    """Camera block of an msalign JSON ImageDescription (focal length, pixel size), or {}."""
+    import json
+    try:
+        info = read_tiff_structure(path)
+        desc = info.ifds[0].get(270) if info and info.ifds else None
+        if isinstance(desc, str) and desc.lstrip().startswith("{"):
+            cam = json.loads(desc).get("camera") or {}
+            return cam if isinstance(cam, dict) else {}
+    except (OSError, ValueError, struct.error, AttributeError):
+        pass
+    return {}
+
+
 EXIF_NAMES = {
     271: "make", 272: "model", 306: "datetime", 33434: "exposure_time", 33437: "f_number",
     34855: "iso", 36867: "datetime_original", 37386: "focal_length",
