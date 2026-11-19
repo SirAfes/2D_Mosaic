@@ -174,6 +174,20 @@ def voronoi_labels(frames, dist, size, scale, score_fn, map_fn):
     return label, (Ws, Hs)
 
 
+def _nanquantile0(st, q):
+    """Quantile along axis 0 ignoring NaN, linear interpolation (as np.nanquantile),
+    vectorised: np.nanpercentile loops over pixels in Python and took minutes."""
+    srt = np.sort(st, axis=0)                       # NaN sort to the end
+    n = np.isfinite(st).sum(0)
+    pos = q * np.maximum(n - 1, 0)
+    lo = np.floor(pos).astype(np.int64)
+    hi = np.minimum(lo + 1, np.maximum(n - 1, 0))
+    frac = (pos - lo).astype(np.float32)
+    vlo = np.take_along_axis(srt, lo[None], 0)[0]
+    vhi = np.take_along_axis(srt, hi[None], 0)[0]
+    return np.where(n > 0, vlo + (vhi - vlo) * frac, np.nan).astype(np.float32)
+
+
 def _per_view_stat(arrays, valids, boxes, size, reducer, min_views, tile=512):
     """
     For each frame, the per-pixel value of ``reducer`` (e.g. median) over all
@@ -208,9 +222,29 @@ def _per_view_stat(arrays, valids, boxes, size, reducer, min_views, tile=512):
     return stat, views
 
 
+def _long_thin(mask, min_len, max_width_ratio=0.25, bridge=None):
+    """Pixels of ``mask`` belonging to long, thin objects. Gaps up to ``bridge`` px
+    (default 12 % of min_len: dashes, markings, parts hidden by the seabed) are
+    bridged; the width is measured on the bridged object."""
+    bridge = bridge or max(5, int(round(0.12 * min_len)) | 1)
+    joined = cv2.dilate(mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                                         (bridge, bridge)))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    out = np.zeros(mask.shape, bool)
+    for i in range(1, n):
+        if np.hypot(st[i, cv2.CC_STAT_WIDTH], st[i, cv2.CC_STAT_HEIGHT]) < min_len:
+            continue
+        ys, xs = np.nonzero(lab == i)
+        (_, _), (a, b), _ = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+        length, width = max(a, b), min(a, b)
+        if length >= min_len and width <= max_width_ratio * length:
+            out |= lab == i
+    return out & mask
+
+
 def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.25, weak_frac=None,
                         halo_px=20, min_views=3, min_object_px=6, veil_ratio=None, veil_sigma=8.0,
-                        min_area_frac=0.01, stats=None):
+                        min_area_frac=0.01, stats=None, keep_long=0.35):
     """
     Per frame, pixels that disagree with the other frames.
 
@@ -228,15 +262,22 @@ def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.
     clearly below it over a coherent region (> ``min_area_frac`` of a frame) is
     veiled or blurred there.
 
+    Long thin objects (``keep_long``): a deviation that is long (more than
+    ``keep_long`` x the frame size), thin (length > 4 x width) and also present
+    near the same place in other views is not treated as moving. That is a transect tape or line held above the bottom: parallax
+    puts it at a slightly different place in every view, so it disagrees with
+    the per-pixel median almost everywhere, and removing it would erase it from
+    the mosaic (Metashape keeps it too). Fish, hands and particles are compact.
+
     Only pixels seen by at least ``min_views`` frames are judged.
     """
     Ws, Hs = size
     boxes = [(cx, cy, cx + v.shape[1], cy + v.shape[0]) for (cx, cy), v in zip(corners, valids)]
-    med, views = _per_view_stat(lum, valids, boxes, size, lambda st: np.nanmedian(st, axis=0), min_views)
+    med, views = _per_view_stat(lum, valids, boxes, size, lambda st: _nanquantile0(st, 0.5), min_views)
     ref = np.nanmax([np.nanmax(m) for m in med if np.isfinite(m).any()] or [1.0])
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     kh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * halo_px + 1, 2 * halo_px + 1))
-    cores, n_bright = [], 0
+    cores, longs, ds, n_bright = [], [], [], 0
     for k in range(len(lum)):
         d = np.abs(lum[k] - med[k]) / (med[k] + 0.05 * ref + 1e-6)
         d = np.where((views[k] >= min_views) & valids[k], np.nan_to_num(d), 0.0)
@@ -246,10 +287,48 @@ def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.
             keep = st[:, cv2.CC_STAT_AREA] >= min_object_px
             keep[0] = False
             core = keep[lab]
-        if weak_frac and core.any():
-            core |= (cv2.dilate(core.astype(np.uint8), kh) > 0) & (d > rel_thr * weak_frac)
-        n_bright += int(core.sum())
+        fs = np.sqrt(max(1.0, float(valids[k].sum())))
+        longs.append(_long_thin(core, keep_long * fs) if keep_long and core.any() else None)
         cores.append(core)
+        ds.append(d)
+    if keep_long and any(lg is not None and lg.any() for lg in longs):
+        # a long thin object is kept only if other views show one close by as well
+        # (a tape seen from slightly different positions); a rope that moved
+        # through one view only is still removed
+        cnt = np.zeros((Hs, Ws), np.int16)
+        near = []
+        for k, (cx, cy) in enumerate(corners):
+            lg = longs[k]
+            if lg is None or not lg.any():
+                near.append(None)
+                continue
+            r = max(2, int(0.06 * np.sqrt(max(1.0, float(valids[k].sum())))))
+            nb = cv2.dilate(lg.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                                           (2 * r + 1, 2 * r + 1)))
+            h, w = lg.shape
+            cnt[cy:cy + h, cx:cx + w] += nb
+            near.append(nb)
+        for k, (cx, cy) in enumerate(corners):
+            lg = longs[k]
+            if lg is None or not lg.any():
+                continue
+            h, w = lg.shape
+            other = (cnt[cy:cy + h, cx:cx + w] - near[k]) > 0
+            n, lab = cv2.connectedComponents(lg.astype(np.uint8), connectivity=8)
+            conf = np.zeros(lg.shape, bool)
+            for i in range(1, n):
+                comp = lab == i
+                if other[comp].mean() >= 0.5:
+                    conf |= comp
+            longs[k] = conf
+            cores[k] = cores[k] & ~conf
+    for k in range(len(lum)):
+        core = cores[k]
+        if weak_frac and core.any():
+            core |= (cv2.dilate(core.astype(np.uint8), kh) > 0) & (ds[k] > rel_thr * weak_frac)
+        n_bright += int(core.sum())
+        cores[k] = core
+    ds = None
 
     n_veil = 0
     if veil_ratio:
@@ -257,12 +336,15 @@ def _consensus_outliers(lum: list, corners: list, valids: list, size, rel_thr=0.
         for k in range(len(lum)):
             g = cv2.GaussianBlur(lum[k].astype(np.float32), (0, 0), 0.8)
             e = np.abs(cv2.Laplacian(g, cv2.CV_32F))
-            m = (valids[k] & ~(cv2.dilate(cores[k].astype(np.uint8), k7) > 0)).astype(np.float32)
+            # moving objects and kept long objects (tape) would make the views that
+            # show them look sharper there
+            ign = cores[k] if longs[k] is None else (cores[k] | longs[k])
+            m = (valids[k] & ~(cv2.dilate(ign.astype(np.uint8), k7) > 0)).astype(np.float32)
             num = cv2.GaussianBlur(e * m, (0, 0), veil_sigma)
             den = cv2.GaussianBlur(m, (0, 0), veil_sigma)
             reg.append(np.where(den > 0.3, num / np.maximum(den, 1e-6), np.nan).astype(np.float32))
         regv = [v & np.isfinite(r) for v, r in zip(valids, reg)]
-        best, vv = _per_view_stat(reg, regv, boxes, size, lambda st: np.nanpercentile(st, 75, axis=0),
+        best, vv = _per_view_stat(reg, regv, boxes, size, lambda st: _nanquantile0(st, 0.75),
                                   min_views)
         floor = 0.25 * float(np.nanmedian(np.concatenate([r[np.isfinite(r)][::50] for r in reg])))
         for k in range(len(lum)):
@@ -340,7 +422,7 @@ def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=N
 
     pos = {fi: k for k, fi in enumerate(idx)}
     usable = [vm.copy() for vm in valids]
-    n_ghost = 0
+    n_ghost = n_fixed = 0
     if deghost:
         lum = [sv.mean(2) / 255.0 for sv in srcs]
         ostats = {}
@@ -372,6 +454,7 @@ def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=N
             lab = label[cy:cy + h, cx:cx + w]
             bad_lab[cy:cy + h, cx:cx + w] |= (lab == idx[k]) & ~usable[k]
         fix = bad_lab & (relabel >= 0)
+        n_fixed = int(fix.sum())
         label = label.copy()
         label[fix] = relabel[fix]
 
@@ -415,8 +498,7 @@ def optimise_seams(frames, dist, size, images: dict, score_fn, map_fn, gain_fn=N
     msg = f"  seamlines optimised (graph cut): {changed * 100:.1f} % of the area moved to another frame"
     if deghost:
         area = max(1, int((base >= 0).sum()))
-        msg += (f"; inconsistent views replaced on {n_ghost * 100 / area:.1f} % of the area "
-                f"(moving objects {ostats.get('bright', 0) * 100 / area:.1f} %, "
-                f"veiled/blurred {ostats.get('veil', 0) * 100 / area:.1f} %, before overlap)")
+        msg += (f"; {n_fixed * 100 / area:.1f} % of the mosaic taken from another view because the "
+                f"nearest one showed a moving object or was veiled/blurred there")
     log(msg)
     return SeamMap(final, s, changed, soft)

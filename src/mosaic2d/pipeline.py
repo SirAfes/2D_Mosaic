@@ -632,6 +632,7 @@ class Project:
         self.timing["matching_s"] = self.timing.get("matching_s", 0) + time.time() - t
         ok = sum(1 for ij in pairs if self.pairs[ij].ok)
         self.log(f"  matched {len(pairs)} pairs: {ok} accepted")
+        return ok
 
     # ---------------------------------------------------------------- adjustment
     def _corr(self):
@@ -905,8 +906,8 @@ class Project:
             extra = self.estimated_pairs()
             if extra:
                 self.log(f"  estimated preselection: {len(extra)} additional overlapping pairs")
-                self.match(extra, trusted=True)
-                self.adjust()
+                if self.match(extra, trusted=True):
+                    self.adjust()
         # images outside the main block: try them against everything once more
         main = set(self.result.components[0])
         lost = [f.index for f in self.frames if f.index not in main]
@@ -916,8 +917,8 @@ class Project:
             extra = [ij for ij in extra if ij in self.generic_scores or abs(ij[0] - ij[1]) <= 6]
             if extra:
                 self.log(f"  {len(lost)} image(s) not connected; trying {len(extra)} more pairs")
-                self.match(extra)
-                self.adjust()
+                if self.match(extra):          # nothing new: the adjustment would be the same
+                    self.adjust()
 
     # ------------------------------------------------------------------ project file
     def save(self, path):
@@ -1137,9 +1138,16 @@ class Project:
         else:
             tif = self.out / f"{name}.tif"
             self.log(f"  writing {tif.name}")
+            step = {"next": 0.1}
+
+            def wprog(fr_):
+                if fr_ >= step["next"]:
+                    self.log(f"  written {min(fr_, 1.0) * 100:.0f} %")
+                    step["next"] = 2.0 if fr_ >= 1.0 else min(1.0, fr_ + 0.1)
             write_tiff(tif, canvas, band_names=names_, wavelengths=wls, nodata=0,
                        description=json.dumps({"mosaic2d": __version__, "images": len(frames)}),
-                       metadata=meta, pixel_size=ps, origin=(0.0, H * ps if ps else 0.0))
+                       metadata=meta, pixel_size=ps, origin=(0.0, H * ps if ps else 0.0),
+                       progress=wprog)
         small = RD.downsample(canvas, 3000)
         cv2.imwrite(str(self.out / f"{name}_preview.jpg"), RD.visualise(small, self.vis_channels()),
                     [cv2.IMWRITE_JPEG_QUALITY, 90])

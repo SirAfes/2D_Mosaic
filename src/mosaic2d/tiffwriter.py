@@ -12,8 +12,10 @@ GDAL's metadata tags, so QGIS / GDAL / rasterio show them.
 
 from __future__ import annotations
 
+import os
 import struct
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -163,28 +165,37 @@ def write_tiff(path, arr, band_names=None, wavelengths=None, nodata=None, descri
                 fh.write(b"II" + struct.pack(E + "HI", 42, 0))
                 first_ptr = 4
             src = arr
-            for k, (h, w) in enumerate(sizes):
-                nxt = level_array(k + 1) if k + 1 < len(sizes) else None
-                offsets, counts = [], []
-                for y in range(0, h, tile):
-                    for x in range(0, w, tile):
-                        t = np.array(src[y:y + tile, x:x + tile])     # copy: no view keeps a memmap open
-                        t = t.reshape(t.shape[0], t.shape[1], C)
-                        data = _encode_tile(t, tile, dtype, level)
-                        offsets.append(fh.tell())
-                        counts.append(len(data))
-                        fh.write(data)
+            workers = max(1, min(8, os.cpu_count() or 1))
+            with ThreadPoolExecutor(workers) as pool:
+                for k, (h, w) in enumerate(sizes):
+                    nxt = level_array(k + 1) if k + 1 < len(sizes) else None
+                    offsets, counts = [], []
+                    for y in range(0, h, tile):
+                        # one sequential read of the whole row of tiles (a memmap read
+                        # tile by tile touches every row 'width / tile' times)
+                        rowband = np.array(src[y:y + tile])          # copy: no view keeps a memmap open
+                        rowband = rowband.reshape(rowband.shape[0], rowband.shape[1], C)
+                        xs = list(range(0, w, tile))
+                        # Deflate and the 2 x 2 reduction release the GIL: tiles in parallel
+                        for data in pool.map(lambda x: _encode_tile(rowband[:, x:x + tile], tile, dtype, level), xs):
+                            offsets.append(fh.tell())
+                            counts.append(len(data))
+                            fh.write(data)
                         if nxt is not None:
-                            d = _downsample2(t)
-                            nxt[y // 2:y // 2 + d.shape[0], x // 2:x // 2 + d.shape[1]] = \
-                                np.clip(np.rint(d), 0, np.iinfo(dtype).max).astype(dtype)
-                        done += 1
-                        if progress and done % 200 == 0:
+                            def red(x):
+                                d = _downsample2(rowband[:, x:x + tile])
+                                return x, np.clip(np.rint(d), 0, np.iinfo(dtype).max).astype(dtype)
+                            parts = dict(pool.map(red, xs))
+                            nxt[y // 2:y // 2 + (rowband.shape[0] + 1) // 2] = \
+                                np.concatenate([parts[x] for x in xs], axis=1)
+                        done += len(xs)
+                        if progress:
                             progress(done / total_tiles)
-                levels_data.append((offsets, counts))
-                if isinstance(nxt, np.memmap):
-                    nxt.flush()
-                src = nxt
+                    levels_data.append((offsets, counts))
+                    if isinstance(nxt, np.memmap):
+                        nxt.flush()
+                    src = nxt
+            rowband = None
             src = nxt = t = None
 
             rgb = C == 3 and not band_names_is_ms(band_names)

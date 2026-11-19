@@ -2,6 +2,27 @@
 
 ## 0.3.0
 
+- Faster output: the TIFF writer reads the mosaic one row of tiles at a time (one
+  sequential pass instead of a scattered read per tile) and compresses tiles in parallel;
+  same bytes as before. Writing the 91 000 x 28 600 px RGB dive mosaic had taken 5 hours.
+- Faster rendering: each frame is drawn in 512 x 512 blocks, and blocks the frame neither
+  wins nor feathers are skipped after a coarse check (with 5-10x overlap most of every
+  frame is covered by better views). Frames are only decoded if they contribute.
+- Seam optimisation: the per-pixel median / percentile over the views is vectorised
+  (NumPy's nanpercentile looped over pixels in Python).
+- Preview image: read in ~256 MB chunks (a 4096-row chunk of a wide mosaic was 4.5 GB).
+- A transect tape or line held above the bottom is kept: a long thin object that is
+  present near the same place in several views (parallax moves it a little between
+  views) is no longer removed as a moving object; it was erased over half of the RGB
+  dive. A rope that moves through a single view is still removed. Such objects are also
+  ignored by the veil (blur) check, which had preferred whichever views showed the tape.
+- Camera adjustment: pairs that do not fit are removed even when that would cut the
+  block in two -- only the best-fitting pair across each cut is kept. Before, one such
+  cut cancelled all removals of the round (RGB dive: RMSE 34.8 -> 19.1 px, median 9.3 ->
+  8.7 px).
+- The adjustment is not repeated when the extra pair search finds no new pairs.
+- Log: writing progress in 10 % steps; the seam message gives the share of the mosaic
+  taken from another view because of a moving object or blur.
 - New default adjustment, `--model camera`: every photo is a camera over one ground plane
   with a shared lens (position, height, heading, two tilts per photo; focal length and
   radial distortion refined from EXIF / profile), soft priors for similar height and

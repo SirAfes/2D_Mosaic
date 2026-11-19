@@ -205,7 +205,7 @@ def run_camera_bundle(nodes, corr, pair_H, sizes, focal_px, focal_sigma=0.3, dis
         e = np.hypot(r[:, 0], r[:, 1])
         med = float(np.median(e))
         # per pair (both directions) medians -> remove pairs that do not fit at all
-        keep_c, dropped = [], False
+        keep_c, dropped, cut = [], False, []
         off = 0
         thr_pair = max(10.0, 6.0 * med)
         thr_pt = max(3.0 * robust_px, 5.0 * 1.4826 * med)
@@ -219,17 +219,32 @@ def run_camera_bundle(nodes, corr, pair_H, sizes, focal_px, focal_sigma=0.3, dis
             pm = float(np.median(ep))
             if pm > thr_pair and c.method != "phasecorr":
                 removed.append({"i": c.i, "j": c.j, "median_px": round(pm, 2), "round": 10 + rnd})
+                cut.append((pm, c))
                 dropped = True
                 continue
             m = ep <= thr_pt
             if m.sum() >= 6:
                 dropped |= bool((~m).any())
                 keep_c.append(BA.Correspondences(c.i, c.j, pp[m], qq[m], c.weight, c.method))
-        comps2 = BA.connected_components(main, [(c.i, c.j) for c in keep_c])
-        if len(comps2) > 1:                         # removals must not split the block here
-            kept = {(c.i, c.j) for c in keep_c}
-            keep_c += [c for c in cs if (c.i, c.j) not in kept]
-            removed = [d for d in removed if d.get("round") != 10 + rnd]
+            else:
+                cut.append((pm, c))
+        # removals must not split the block here: put back the best-fitting removed
+        # pairs until it is connected again (the others stay out)
+        parent = {n: n for n in main}
+
+        def root(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        for c in keep_c:
+            parent[root(c.i)] = root(c.j)
+        for pm, c in sorted(cut, key=lambda t: t[0]):
+            if root(c.i) != root(c.j):               # this pair is the only link: keep it
+                parent[root(c.i)] = root(c.j)
+                keep_c.append(c)
+                removed = [d for d in removed if not (d.get("round") == 10 + rnd and d["i"] == c.i
+                                                      and d["j"] == c.j)]
         cs = keep_c
         prob = build(cs)
         f_now = float(np.exp(g[0]))

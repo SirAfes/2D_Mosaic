@@ -5,7 +5,8 @@ Out-of-core mosaic rendering.
 
 The canvas lives in a disk-backed NumPy memmap, so the mosaic can be much
 larger than memory. Frames are decoded one at a time (frame-major order) and
-written strip by strip.
+written block by block; blocks a frame neither wins nor feathers are skipped
+after a coarse check.
 
 Which frame supplies a pixel (the *seam* layout) is decided analytically: the
 frame in which the pixel lies closest to the image centre wins (elliptical
@@ -459,26 +460,29 @@ class Renderer:
         return [g for g in self.frames if g is not fr and g.bbox[0] < x1 and g.bbox[2] > x0
                 and g.bbox[1] < y1 and g.bbox[3] > y0]
 
-    def _lose_mask(self, fr, others, X, Y, x0, x1, ys, ye, step=4):
+    def _lose_coarse(self, fr, others, xs, xe, ys, ye, step=4):
         """
-        Pixels of the strip that another frame wins (seam decision).
+        Coarse seam decision for the block [ys:ye, xs:xe] on every `step`-th
+        pixel: (valid, lose, Xc, Yc), with one grid cell of margin on every side.
 
-        Evaluated on a grid of every `step`-th pixel and upsampled: seam
-        positions only need to be approximately right, and this is ~step^2
-        times cheaper with many overlapping frames. The coarse mask is eroded
-        by one cell so that, near any boundary, the current frame keeps the
-        pixel -- coarse decisions can therefore create small overlaps (later
+        `lose` marks cells that another frame wins. Seam positions only need to
+        be approximately right, and this is ~step^2 times cheaper with many
+        overlapping frames. The mask is eroded by one cell (the margin makes this
+        independent of block boundaries) so that, near any seam, the current frame
+        keeps the pixel -- coarse decisions can create small overlaps (later
         frames overwrite) but never holes.
         """
-        h, w = X.shape
-        cand = [g for g in others if g.bbox[0] < x1 and g.bbox[2] > x0
+        Xc, Yc = np.meshgrid(np.arange(xs - step, xe + step, step, dtype=np.float64),
+                             np.arange(ys - step, ye + step, step, dtype=np.float64))
+        uc, vc = _map(fr, Xc, Yc)
+        sc, valid, _, _ = _score(fr, uc, vc, self.dist)
+        lose = np.zeros(Xc.shape, bool)
+        if self.blend == "average" or not valid.any():
+            return valid, lose, Xc, Yc
+        cand = [g for g in others if g.bbox[0] < xe and g.bbox[2] > xs
                 and g.bbox[1] < ye and g.bbox[3] > ys]
         if not cand:
-            return np.zeros((h, w), bool)
-        Xc, Yc = X[::step, ::step], Y[::step, ::step]
-        uc, vc = _map(fr, Xc, Yc)
-        sc, _, _, _ = _score(fr, uc, vc, self.dist)
-        lose = np.zeros(Xc.shape, bool)
+            return valid, lose, Xc, Yc
         if self.seams is not None:
             # optimised seamlines decide, as long as the chosen frame really covers the pixel
             lab = self.seams.sample(Xc, Yc)
@@ -498,10 +502,14 @@ class Renderer:
                 ug, vg = _map(g, Xc, Yc)
                 sg, vgm, _, _ = _score(g, ug, vg, self.dist)
                 lose |= open_ & vgm & ((sg < sc) | ((sg == sc) & (g.index < fr.index)))
-        if not lose.any():
-            return np.zeros((h, w), bool)
-        lose = cv2.erode(lose.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-        return np.repeat(np.repeat(lose, step, 0), step, 1)[:h, :w]
+        if lose.any():
+            lose = cv2.erode(lose.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        return valid, lose, Xc, Yc
+
+    @staticmethod
+    def _upsample(mask, step, h, w):
+        """Coarse cell mask (with one cell of margin) -> h x w pixel mask."""
+        return np.repeat(np.repeat(mask[1:-1, 1:-1], step, 0), step, 1)[:h, :w]
 
     def render(self, load_lenses, out_name="mosaic"):
         """load_lenses(frame) -> {lens: H x W x C array}. Returns the memmap."""
@@ -524,68 +532,83 @@ class Renderer:
                       and bool(self.seams.soft))
         seam_acc = _SeamAccumulator(self.B) if feathering else None
 
+        step, block_w = 4, 512
         for n, fr in enumerate(self.frames):
             x0, y0, x1, y1 = fr.bbox
             if x1 <= x0 or y1 <= y0:
                 continue
-            lenses = load_lenses(fr)
+            lenses = None
             others = self._others(fr)
             Ainv = {ln: np.linalg.inv(fr.lens_A[ln]) for ln in fr.lens_A}
+            # blocks of strip x block_w px; a coarse pass first skips blocks this frame
+            # neither wins nor feathers (most of a frame with 5-10x overlap)
             for ys in range(y0, y1, self.strip):
                 ye = min(y1, ys + self.strip)
-                X, Y = np.meshgrid(np.arange(x0, x1, dtype=np.float64) + 0.0,
-                                   np.arange(ys, ye, dtype=np.float64))
-                u, v = _map(fr, X, Y)
-                s, valid, ud, vd = _score(fr, u, v, self.dist)
-                if not valid.any():
-                    continue
-                if self.blend == "average":
-                    sel = valid
-                else:
-                    sel = valid & ~self._lose_mask(fr, others, X, Y, x0, x1, ys, ye)
-                band = None
-                if feathering:
-                    wf = self.seams.weight(fr.index, X, Y)
-                    if wf is not None:
+                for xs in range(x0, x1, block_w):
+                    xe = min(x1, xs + block_w)
+                    valid_c, lose_c, Xc, Yc = self._lose_coarse(fr, others, xs, xe, ys, ye, step)
+                    if not valid_c.any():
+                        continue
+                    need = valid_c & ~lose_c
+                    wf_c = self.seams.weight(fr.index, Xc, Yc) if feathering else None
+                    if wf_c is not None:
+                        need |= valid_c & (wf_c > 0.002) & (wf_c < 0.998)
+                    if not (cv2.dilate(need.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)[1:-1, 1:-1].any():
+                        continue
+                    X, Y = np.meshgrid(np.arange(xs, xe, dtype=np.float64),
+                                       np.arange(ys, ye, dtype=np.float64))
+                    u, v = _map(fr, X, Y)
+                    s, valid, ud, vd = _score(fr, u, v, self.dist)
+                    if not valid.any():
+                        continue
+                    if self.blend == "average":
+                        sel = valid
+                    else:
+                        sel = valid & ~self._upsample(lose_c, step, *X.shape)
+                    band = None
+                    if wf_c is not None:
+                        wf = self.seams.weight(fr.index, X, Y)
                         band = valid & (wf > 0.002) & (wf < 0.998)
                         if not band.any():
                             band = None
-                region = sel if band is None else (sel | band)
-                if not region.any():
-                    continue
-                rows = np.where(region.any(1))[0]
-                cols = np.where(region.any(0))[0]
-                r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
-                sel = sel[r0:r1, c0:c1]
-                udc, vdc = ud[r0:r1, c0:c1], vd[r0:r1, c0:c1]
-                vals = np.zeros(sel.shape + (self.B,), np.float32)
-                for ln, A in Ainv.items():
-                    bands = [b for b, (bl, _) in enumerate(self.band_sources) if bl == ln]
-                    if not bands:
+                    region = sel if band is None else (sel | band)
+                    if not region.any():
                         continue
-                    mx = (A[0, 0] * udc + A[0, 1] * vdc + A[0, 2]).astype(np.float32)
-                    my = (A[1, 0] * udc + A[1, 1] * vdc + A[1, 2]).astype(np.float32)
-                    img = lenses[ln]
-                    chans = [self.band_sources[b][1] for b in bands]
-                    sub = img[..., chans] if img.ndim == 3 else img[..., None]
-                    r = _remap_multi(np.ascontiguousarray(sub), mx, my)
-                    vals[..., bands] = r
-                Xc, Yc = X[r0:r1, c0:c1], Y[r0:r1, c0:c1]
-                if self.flat is not None:
-                    vals /= np.maximum(self._flat_at(fr, udc, vdc), 0.05)
-                if self.blend == "mosaic" and fr.index in self.gain:  # two-band blending
-                    vals *= self._gain_at(fr, Xc, Yc)
-                oy, ox = ys + r0, x0 + c0
-                if self.blend == "average":
-                    w = _cheb_weight(fr, udc, vdc) * sel + 1e-6 * sel
-                    acc[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += vals * w[..., None]
-                    wsum[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += w
-                else:
-                    tgt = out[oy:oy + sel.shape[0], ox:ox + sel.shape[1]]
-                    v = np.clip(vals, 1, self.maxv).astype(self.dtype)
-                    tgt[sel] = v[sel]
-                    if band is not None:
-                        seam_acc.add(oy, ox, band[r0:r1, c0:c1], vals, wf[r0:r1, c0:c1])
+                    if lenses is None:
+                        lenses = load_lenses(fr)
+                    rows = np.where(region.any(1))[0]
+                    cols = np.where(region.any(0))[0]
+                    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+                    sel = sel[r0:r1, c0:c1]
+                    udc, vdc = ud[r0:r1, c0:c1], vd[r0:r1, c0:c1]
+                    vals = np.zeros(sel.shape + (self.B,), np.float32)
+                    for ln, A in Ainv.items():
+                        bands = [b for b, (bl, _) in enumerate(self.band_sources) if bl == ln]
+                        if not bands:
+                            continue
+                        mx = (A[0, 0] * udc + A[0, 1] * vdc + A[0, 2]).astype(np.float32)
+                        my = (A[1, 0] * udc + A[1, 1] * vdc + A[1, 2]).astype(np.float32)
+                        img = lenses[ln]
+                        chans = [self.band_sources[b][1] for b in bands]
+                        sub = img[..., chans] if img.ndim == 3 else img[..., None]
+                        r = _remap_multi(np.ascontiguousarray(sub), mx, my)
+                        vals[..., bands] = r
+                    Xb, Yb = X[r0:r1, c0:c1], Y[r0:r1, c0:c1]
+                    if self.flat is not None:
+                        vals /= np.maximum(self._flat_at(fr, udc, vdc), 0.05)
+                    if self.blend == "mosaic" and fr.index in self.gain:  # two-band blending
+                        vals *= self._gain_at(fr, Xb, Yb)
+                    oy, ox = ys + r0, xs + c0
+                    if self.blend == "average":
+                        w = _cheb_weight(fr, udc, vdc) * sel + 1e-6 * sel
+                        acc[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += vals * w[..., None]
+                        wsum[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += w
+                    else:
+                        tgt = out[oy:oy + sel.shape[0], ox:ox + sel.shape[1]]
+                        v = np.clip(vals, 1, self.maxv).astype(self.dtype)
+                        tgt[sel] = v[sel]
+                        if band is not None:
+                            seam_acc.add(oy, ox, band[r0:r1, c0:c1], vals, wf[r0:r1, c0:c1])
             del lenses
             if self.progress:
                 self.progress(n + 1, len(self.frames))
@@ -633,7 +656,10 @@ def downsample(arr, max_side=3000):
     f = max(1, int(np.ceil(max(H, W) / max_side)))
     Ho, Wo = H // f, W // f
     out = np.zeros((Ho, Wo, arr.shape[2]), np.float32)
-    rows = max(f, (4096 // f) * f)
+    # row chunks of about 256 MB as float32 (a 4096-row chunk of a 90 000 px wide
+    # mosaic was 4.5 GB and made machines with little memory swap)
+    C = arr.shape[2]
+    rows = f * max(1, int(256e6 / (Wo * f * C * 4) / f))
     for y in range(0, Ho * f, rows):
         blk = np.asarray(arr[y:min(y + rows, Ho * f), :Wo * f]).astype(np.float32)
         h = blk.shape[0] // f

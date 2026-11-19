@@ -22,7 +22,7 @@ def _texture(w, h, seed=0):
     return (rgb * 50000 + 2000).astype(np.uint16)
 
 
-def _survey(tmp_path, n_cols=4, n_rows=2, w=900, h=600, seed=1):
+def _survey(tmp_path, n_cols=4, n_rows=2, w=900, h=600, seed=1, step=600, tape_y=None):
     rng = np.random.default_rng(seed)
     world = _texture(3600, 1800, seed)
     truth = {}
@@ -30,7 +30,7 @@ def _survey(tmp_path, n_cols=4, n_rows=2, w=900, h=600, seed=1):
     for r in range(n_rows):
         cols = range(n_cols) if r % 2 == 0 else reversed(range(n_cols))  # zig-zag
         for c in cols:
-            x, y = 250 + c * 600, 250 + r * 420
+            x, y = 250 + c * step, 250 + r * 420
             a = np.deg2rad(rng.normal(0, 3))
             s = 1 + rng.normal(0, 0.03)
             # a real camera over the textured plane (focal 1100 px, height s, small tilt);
@@ -39,7 +39,14 @@ def _survey(tmp_path, n_cols=4, n_rows=2, w=900, h=600, seed=1):
             tilt = np.deg2rad(rng.normal(0, 1.0, 2))
             Hc = CAM.image_to_plane([0.0, 0.0, np.log(s * f), tilt[0], tilt[1], -a], f, (w / 2, h / 2))
             H = np.array([[1, 0, x + s * w / 2], [0, 1, y + s * h / 2], [0, 0, 1]]) @ Hc
-            img = cv2.warpPerspective(world, np.linalg.inv(H), (w, h), flags=cv2.INTER_LINEAR)
+            src_world = world
+            if tape_y is not None:
+                # a dashed tape held above the bottom: parallax moves it between views
+                src_world = world.copy()
+                dy = int(rng.integers(-25, 26))
+                for x0 in range(0, world.shape[1], 60):
+                    cv2.line(src_world, (x0, tape_y + dy), (x0 + 42, tape_y + dy), (65535,) * 3, 7)
+            img = cv2.warpPerspective(src_world, np.linalg.inv(H), (w, h), flags=cv2.INTER_LINEAR)
             img = img.astype(np.float32) * np.float32(1 - 0.25 * ((np.linspace(-1, 1, w)[None] ** 2
                                                                 + np.linspace(-1, 1, h)[:, None] ** 2) / 2))[..., None]
             img = np.clip(img + rng.normal(0, 300, img.shape), 0, 65535).astype(np.uint16)
@@ -175,3 +182,25 @@ def test_separate_groups_rendered_as_blocks(tmp_path):
     out = tifffile.imread(tmp_path / "out" / "mosaic_block02.tif")
     assert (out[..., 0] > 0).mean() > 0.3
     assert proj.result.components[0] == sorted(proj.result.components[0])   # main result restored
+
+
+def test_floating_tape_is_kept(tmp_path):
+    """A long thin object that moves between views (transect tape above the
+    bottom) is not removed as a moving object."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=8, n_rows=1, step=200, tape_y=560, seed=5)
+    s = Settings(methods="sift", accuracy="high", resolution=0.5, distortion=False,
+                 n_features=3000, jobs=2, flatfield="none")
+    proj, rep = run(src, tmp_path / "out", s)
+    assert rep["aligned_images"] == 8
+    img = rawio.read_image(tmp_path / "out" / "mosaic.tif").astype(np.float32)
+    covered = (img > 0).all(2)
+    hi = np.percentile(img[covered], 99.9, axis=0)
+    tape = (img > 0.8 * hi).all(2)          # only the tape is bright in all three channels
+    cols = np.where(covered.any(0))[0]
+    inner = tape[:, cols[0] + 40:cols[-1] - 40]
+    # the tape crosses the whole mosaic: tape pixels in (nearly) every 30-px stretch
+    # (the dashes are 21 px with 9 px gaps at this resolution)
+    runs = inner.any(0)[: inner.shape[1] // 30 * 30].reshape(-1, 30).any(1)
+    assert runs.mean() > 0.9, runs.astype(int)
