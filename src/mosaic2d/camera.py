@@ -269,7 +269,7 @@ def run_camera_bundle(nodes, corr, pair_H, sizes, focal_px, focal_sigma=0.3, dis
     per_pair, per_img = [], {n: [] for n in main}
     off = 0
     for c in cs:
-        n = len(c.p)
+        n = len(BA._thin(c.p, c.q, max_corr_per_pair, sizes[c.i])[0])   # as in build()
         ec = np.concatenate([e[off:off + n], e[off + n:off + 2 * n]])
         off += 2 * n
         per_pair.append({"i": c.i, "j": c.j, "method": c.method, "n": n,

@@ -119,3 +119,17 @@ def test_camera_model_does_not_drift_where_homography_does():
 def BA_scale(H, c):
     from mosaic2d.pipeline import local_scale
     return local_scale(H, *c)
+
+
+def test_per_pair_statistics_belong_to_their_pair():
+    """Pair statistics are read from the thinned tie points the adjustment used."""
+    poses, corr, pairH, sizes = _survey(n_cols=6, n_rows=1, seed=2)
+    rng = np.random.default_rng(1)
+    k = len(corr) // 2
+    c = corr[k]
+    corr[k] = BA.Correspondences(c.i, c.j, c.p, c.q + rng.normal(0, 4.0, c.q.shape), c.weight, c.method)
+    r = CAM.run_camera_bundle(list(range(len(poses))), corr, pairH, sizes, focal_px=F_TRUE,
+                              distortion=False, log=lambda *a: None)
+    worst = max(r.per_pair, key=lambda d: d["median_px"])
+    assert (worst["i"], worst["j"]) == (c.i, c.j), (worst, (c.i, c.j))
+    assert all(np.isfinite(d["rmse_px"]) for d in r.per_pair)

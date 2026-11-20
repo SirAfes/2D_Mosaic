@@ -16,6 +16,12 @@
   looked sharper than the one before it; along a 281-photo ledge transect the quality
   went from 0.00 to 3000 and half the photos were wrongly called blurred.
 - `mosaic2d render --readjust` re-estimates the image quality from the ingest cache.
+- `--lens-from <earlier output folder | report.json | project.pkl>` (also in the window):
+  reuse the focal length and distortion of an earlier run with the same camera and
+  housing instead of estimating them, e.g. for a wall or ledge after a flat survey.
+- Camera adjustment: per-pair residuals in the report and pairs.csv are read from the
+  same thinned tie points the adjustment used (a pair kept to hold the block together
+  could shift the numbers of all later pairs).
 - Faster output: the TIFF writer reads the mosaic one row of tiles at a time (one
   sequential pass instead of a scattered read per tile) and compresses tiles in parallel;
   same bytes as before. Writing the 91 000 x 28 600 px RGB dive mosaic had taken 5 hours.
