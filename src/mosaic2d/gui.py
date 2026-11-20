@@ -37,7 +37,7 @@ class _QueueWriter:
 
 
 def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", height=None,
-               sequence=False, lens_from=None):
+               sequence=False, lens_from=None, ref_band=None):
     argv = ["run", str(inp), "--resolution", str(resolution), "--profile", profile,
             "--accuracy", accuracy, "--name", name]
     if height:
@@ -50,6 +50,8 @@ def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", he
         argv += ["--sequence"]
     if lens_from:
         argv += ["--lens-from", str(lens_from)]
+    if ref_band:
+        argv += ["--ref-band", str(ref_band)]
     return argv
 
 
@@ -76,6 +78,7 @@ class App:
         self.v_height = tk.StringVar(value="")
         self.v_seq = tk.BooleanVar(value=False)
         self.v_lens = tk.StringVar(value="")
+        self.v_ref = tk.StringVar(value="")
         self.v_status = tk.StringVar(value="Choose the folder with the photos.")
 
         f = ttk.Frame(root, padding=10)
@@ -105,6 +108,8 @@ class App:
                 ttk.Entry(opts, textvariable=var, width=width).pack(side="left", padx=(0, 12))
             else:
                 ttk.Combobox(opts, textvariable=var, values=values, width=width).pack(side="left", padx=(0, 12))
+        ttk.Label(opts, text="Ref. band").pack(side="left", padx=(0, 4))
+        ttk.Entry(opts, textvariable=self.v_ref, width=8).pack(side="left", padx=(0, 12))
         ttk.Label(opts, text="Height (m)").pack(side="left", padx=(0, 4))
         ttk.Entry(opts, textvariable=self.v_height, width=6).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts, text="8192 px tiles + .vrt", variable=self.v_tiles).pack(side="left")
@@ -179,7 +184,7 @@ class App:
         self.out_dir = Path(out)
         argv = build_argv(inp, out, res, self.v_prof.get(), self.v_acc.get(), self.v_tiles.get(),
                           self.v_name.get().strip() or "mosaic", height, self.v_seq.get(),
-                          self.v_lens.get().strip() or None)
+                          self.v_lens.get().strip() or None, self.v_ref.get().strip() or None)
         self.log.delete("1.0", "end")
         self.q.put("mosaic2d " + " ".join(argv) + "\n\n")
         self.b_run.configure(state="disabled")

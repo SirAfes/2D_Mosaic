@@ -2,6 +2,12 @@
 
 ## 0.3.0
 
+- Reference band (multispectral): photos from three places in the series (1/4, 1/2,
+  3/4) instead of six consecutive middle ones; every band is scored by verified matches
+  between consecutive photos times their spread, reduced for clipped (saturated) and
+  nearly black pixels; the log lists matches, saturation and black share per band. If
+  no band matches, the band nearest 550 nm with the least clipping is used. Faster (ranking at 1400 px). "Ref. band" field in the window to
+  set it by hand (e.g. 560 nm).
 - Viewer for large and multispectral mosaics: `mosaic2d view file.tif`, or "View a
   mosaic..." in the window. Reads only the tiles on screen from the overview level that
   fits the zoom; any three bands (or one) with a percentile stretch, presets for natural

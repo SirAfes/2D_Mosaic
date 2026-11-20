@@ -185,28 +185,73 @@ def consensus_check(results: list[FrameLensAlignment], tol_px: float = 12.0,
     return med, bad
 
 
+def band_saturation(img: np.ndarray) -> tuple[float, float]:
+    """(fraction of clipped pixels, fraction of near-black pixels) of one band,
+    zero pixels (no data, e.g. borders left by band alignment) not counted."""
+    v = img.reshape(-1)
+    v = v[:: max(1, v.size // 500000)]
+    v = v[v > 0]
+    if v.size == 0:
+        return 0.0, 1.0
+    if np.issubdtype(img.dtype, np.integer):
+        top = float(np.iinfo(img.dtype).max)
+        vmax = float(v.max())
+        if vmax < top:                  # 10/12/14-bit data in 16-bit words: its own ceiling
+            bits = int(np.ceil(np.log2(vmax + 1)))
+            top = min(top, float(2 ** bits - 1))
+    else:
+        top = float(v.max())
+    sat = float((v >= 0.98 * top).mean())
+    dark = float((v <= 0.01 * top).mean())
+    return sat, dark
+
+
 def choose_reference_band(frames_data: list, prof: CameraProfile, method,
-                          match_fn, work_scale: float, log=print) -> tuple[Band, dict]:
+                          match_fn, work_scale: float, log=print, groups=None) -> tuple[Band, dict]:
     """
-    frames_data: list of FrameData for a sample of consecutive frames.
+    Pick the band whose images match best between consecutive photos.
+
+    frames_data: FrameData of a sample of photos; ``groups`` lists runs of
+    consecutive indices into it (default: all in one run). Every band of every
+    photo is matched with the next photo of its run; the score is the median
+    number of verified matches, reduced for clipped (saturated) pixels - clipped
+    areas carry no texture and no usable values - and for nearly black images.
     method: callable(img_u8) -> Features ; match_fn(fa, fb) -> PairResult
-    Returns (best band, {band name: median inliers}).
+    Returns (best band, {band name: score}).
     """
-    scores = {}
+    groups = groups or [list(range(len(frames_data)))]
+    scores, info = {}, {}
     for b in prof.bands:
-        imgs = []
-        for fd in frames_data:
-            g = band_image(fd, b).astype(np.float32)
+        raw = [band_image(fd, b) for fd in frames_data]
+        sd = np.array([band_saturation(r) for r in raw])
+        sat, dark = float(np.median(sd[:, 0])), float(np.median(sd[:, 1]))
+        feats = []
+        for r in raw:
+            g = r.astype(np.float32)
             if work_scale != 1.0:
                 g = cv2.resize(g, None, fx=work_scale, fy=work_scale, interpolation=cv2.INTER_AREA)
-            imgs.append(normalise_for_features(g))
-        feats = [method(g) for g in imgs]
+            feats.append(method(normalise_for_features(g)))
         inl = []
-        for k in range(len(feats) - 1):
-            r = match_fn(feats[k], feats[k + 1])
-            inl.append(r.n_inliers if r.ok else 0)
-        scores[b.name] = float(np.median(inl)) if inl else 0.0
-    best = max(prof.bands, key=lambda b: (scores[b.name], -abs((b.wavelength_nm or 550) - 550)))
-    log("  reference band scores (median verified inliers): " +
-        ", ".join(f"{k}: {v:.0f}" for k, v in sorted(scores.items(), key=lambda kv: -kv[1])))
+        for run in groups:
+            for k in range(len(run) - 1):
+                rr = match_fn(feats[run[k]], feats[run[k + 1]])
+                inl.append(rr.n_inliers * min(1.0, rr.coverage / 0.2) if rr.ok else 0.0)
+        m = float(np.median(inl)) if inl else 0.0
+        penalty = max(0.0, 1.0 - 10.0 * sat) * max(0.0, 1.0 - dark)
+        scores[b.name] = round(m * penalty, 1)
+        info[b.name] = (m, sat, dark)
+
+    def key(b):
+        return (scores[b.name], -abs((b.wavelength_nm or 550) - 550))
+    best = max(prof.bands, key=key)
+    log("  reference band scores (matches between consecutive photos x coverage, "
+        "minus clipped/black pixels):")
+    for name, v in sorted(scores.items(), key=lambda kv: -kv[1]):
+        m, sat, dark = info[name]
+        log(f"    {name:>10s}: {v:7.0f}   matches {m:6.0f}   saturated {sat * 100:5.2f} %   "
+            f"black {dark * 100:5.1f} %")
+    if scores[best.name] <= 0:
+        # nothing matched (e.g. a sample of blank photos): green-most band with least clipping
+        best = min(prof.bands, key=lambda b: (info[b.name][1] > 0.01, abs((b.wavelength_nm or 550) - 550)))
+        log(f"  no band matched in the sample; using {best.name}")
     return best, scores

@@ -305,17 +305,27 @@ class Project:
         if not prof.multilens and prof.name == "rgb":
             self.ref_band = None  # luminance of all channels
             return
+        # runs of consecutive photos at 1/4, 1/2 and 3/4 of the series (one run of the
+        # middle photos could be blank water, a slate or a turn)
         n = len(self.files)
-        k = min(6, n)
-        start = max(0, n // 2 - k // 2)
-        sample = [SR.load_frame(f, prof, self.s.demosaic) for f in self.files[start:start + k]]
+        run_len = 3 if n >= 9 else min(n, 6)
+        starts = sorted({max(0, min(n - run_len, int(n * q) - run_len // 2))
+                         for q in ((0.25, 0.5, 0.75) if n >= 9 else (0.5,))})
+        idx, groups = [], []
+        for st in starts:
+            g = [i for i in range(st, st + run_len) if i not in idx]
+            groups.append(list(range(len(idx), len(idx) + len(g))))
+            idx += g
+        sample = [SR.load_frame(self.files[i], prof, self.s.demosaic) for i in idx]
         any_lens = sample[0].lenses[prof.bands[0].lens]
-        ws = self._work_scale(any_lens.shape[1], any_lens.shape[0])
+        # band ranking does not need the full working resolution
+        ws = min(self._work_scale(any_lens.shape[1], any_lens.shape[0]), 1400 / max(any_lens.shape[:2]))
         meth = self.registry[self.methods[0]].build
         p = self.s.match_params()
         p.guided = False
         best, scores = BD.choose_reference_band(
-            sample, prof, lambda g: meth(g), lambda a, b: MT.match_pair(a, b, 0, 1, p), ws, self.log)
+            sample, prof, lambda g: meth(g), lambda a, b: MT.match_pair(a, b, 0, 1, p), ws, self.log,
+            groups=groups)
         self.ref_band, self.band_scores = best, scores
         self.log(f"  reference band: {best.name} (lens {best.lens})")
 
@@ -441,14 +451,16 @@ class Project:
             self._select_reference_band()
             return
         import hashlib
-        key = "refband_" + hashlib.sha1(repr([self.prof.name, self.methods[0], self.s.accuracy] + [
+        key = "refband2_" + hashlib.sha1(repr([self.prof.name, self.methods[0], self.s.accuracy] + [
             (f.name, f.stat().st_size) for f in self.files]).encode()).hexdigest()[:16]
         hit = self._cache_load(key)
         if hit is not None:
-            name, self.band_scores = hit
-            self.ref_band = None if name is None else next(b for b in self.prof.bands if b.name == name)
-            self.log(f"  reference band (cached): {name}")
-            return
+            name, scores = hit
+            band = None if name is None else next((b for b in self.prof.bands if b.name == name), None)
+            if name is None or band is not None:
+                self.ref_band, self.band_scores = band, scores
+                self.log(f"  reference band (cached): {name}")
+                return
         self._select_reference_band()
         self._cache_save(key, (self.ref_band.name if self.ref_band else None, self.band_scores))
 
