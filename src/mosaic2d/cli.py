@@ -47,6 +47,14 @@ def _add_common(p: argparse.ArgumentParser):
     p.add_argument("--preselection", default="auto",
                    choices=["auto", "sequential", "generic", "exhaustive"])
     p.add_argument("--window", type=int, default=3, help="sequential neighbours matched per image")
+    p.add_argument("--lens-from", default=None, dest="lens_from",
+                   help="report.json, project.pkl or output folder of an earlier run with the same "
+                        "camera and housing: reuse its focal length and distortion instead of "
+                        "estimating them (useful when the scene is not flat, e.g. a wall or ledge)")
+    p.add_argument("--sequence", action="store_true",
+                   help="photos taken as a series (file names in shooting order): neighbours are "
+                        "matched with relaxed thresholds and every method, and gaps between "
+                        "consecutive photos are bridged with the typical step")
     p.add_argument("--no-distortion", dest="distortion", action="store_false",
                    help="do not self-calibrate radial lens distortion")
     p.add_argument("--ref-band", default=None, help='reference band for multispectral, e.g. "560 nm"')
@@ -109,6 +117,10 @@ def build_parser():
                          "(after an update of mosaic2d), then render")
     rr.add_argument("--model", default=None, choices=["camera", "homography", "affine", "similarity", "rigid", "translation"],
                     help="with --readjust: transform model (default camera)")
+    rr.add_argument("--sequence", action="store_true",
+                    help="with --readjust: bridge gaps between consecutive photos (shooting order)")
+    rr.add_argument("--lens-from", default=None, dest="lens_from",
+                    help="with --readjust: reuse the lens calibration of an earlier run")
     rr.add_argument("--work-dir", default=None)
     rr.add_argument("--name", default="mosaic")
     b = sub.add_parser("benchmark", help="compare feature methods on the same images")
@@ -141,7 +153,12 @@ def main(argv=None):
                             feather=args.feather, min_block=args.min_block)
         if args.readjust:
             proj.s.model = args.model or "camera"
+            if args.sequence:
+                proj.s.sequence = True
+            if args.lens_from:
+                proj.s.lens_from = args.lens_from
             proj.adjust()
+            proj.refresh_quality()
             proj.save(Path(args.project).with_name(f"{args.name}_project.pkl"))
         proj.render(args.name)
         proj.report(args.name)

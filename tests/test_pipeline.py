@@ -204,3 +204,66 @@ def test_floating_tape_is_kept(tmp_path):
     # (the dashes are 21 px with 9 px gaps at this resolution)
     runs = inner.any(0)[: inner.shape[1] // 30 * 30].reshape(-1, 30).any(1)
     assert runs.mean() > 0.9, runs.astype(int)
+
+
+def test_sharpness_falloff_inside_frames_is_not_drift(tmp_path):
+    """Every frame sharp on one side and soft on the other (camera tilted forward,
+    far edge seen through more water): all frames are equally good, the quality
+    must not drift along the strip."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=8, n_rows=1, step=200, seed=3)
+    for f in sorted(src.glob("*.tif")):
+        img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED).astype(np.float32)
+        soft = cv2.GaussianBlur(img, (0, 0), 2.5)
+        t = np.linspace(0, 1, img.shape[1], dtype=np.float32)[None, :, None]
+        cv2.imwrite(str(f), (img * (1 - t) + soft * t).astype(np.uint16))
+    s = Settings(methods="sift", accuracy="high", resolution=0.25, distortion=False,
+                 n_features=3000, jobs=2)
+    proj, rep = run(src, tmp_path / "out", s)
+    q = np.array([f.quality for f in proj.frames])
+    assert q.max() / q.min() < 1.4, q
+
+
+@pytest.mark.parametrize("sequence", [False, True])
+def test_sequence_mode_bridges_featureless_photo(tmp_path, sequence):
+    """A photo without usable texture in the middle of a series cuts the strip in
+    two. In sequence mode the gap is bridged with the typical step between
+    consecutive photos and the series stays one mosaic in the right order."""
+    src = tmp_path / "src"
+    src.mkdir()
+    truth = _survey(src, n_cols=7, n_rows=1, step=450, seed=2)
+    blank = src / "IMG_003.tif"
+    img = cv2.imread(str(blank), cv2.IMREAD_UNCHANGED)
+    cv2.imwrite(str(blank), np.full_like(img, int(img.mean())))
+    s = Settings(methods="sift", accuracy="high", resolution=0.25, distortion=False,
+                 n_features=3000, jobs=2, min_block=0, sequence=sequence)
+    proj, rep = run(src, tmp_path / "out", s)
+    if not sequence:
+        assert rep["aligned_images"] < 7
+        return
+    assert rep["aligned_images"] == 7
+    assert len(rep["sequence_links"]) == 2
+    names = [f.path.name for f in proj.frames]
+    est = np.array([cv2.perspectiveTransform(np.array([[[450.0, 300.0]]]), proj.result.H[k])[0, 0]
+                    for k in range(7)])
+    tru = np.array([cv2.perspectiveTransform(np.array([[[450.0, 300.0]]]), truth[n])[0, 0] for n in names])
+    from test_camera import _similarity_fit
+    err = np.hypot(*(_similarity_fit(est, tru) - tru).T)
+    assert err.max() < 0.15 * 900, err
+    assert proj.frames[3].quality <= 0.3
+
+
+def test_lens_from_earlier_run(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=4, n_rows=1, step=450, seed=6)
+    s = Settings(methods="sift", accuracy="high", resolution=0.2, distortion=False, n_features=3000,
+                 jobs=2, min_block=0)
+    run(src, tmp_path / "a", s, render=False)
+    rep_a = json.loads((tmp_path / "a" / "mosaic_report.json").read_text())
+    s2 = Settings(methods="sift", accuracy="high", resolution=0.2, distortion=False, n_features=3000,
+                  jobs=2, min_block=0, lens_from=str(tmp_path / "a"))
+    proj, rep = run(src, tmp_path / "b", s2, render=False)
+    assert abs(rep["camera"]["focal_px"] / rep_a["camera"]["focal_px"] - 1) < 0.03
+    assert "lens from mosaic_report.json" in (tmp_path / "b" / "mosaic2d.log").read_text()

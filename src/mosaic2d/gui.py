@@ -36,7 +36,8 @@ class _QueueWriter:
         pass
 
 
-def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", height=None):
+def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", height=None,
+               sequence=False, lens_from=None):
     argv = ["run", str(inp), "--resolution", str(resolution), "--profile", profile,
             "--accuracy", accuracy, "--name", name]
     if height:
@@ -45,6 +46,10 @@ def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", he
         argv += ["-o", str(out)]
     if tiles:
         argv += ["--tiles", "8192"]
+    if sequence:
+        argv += ["--sequence"]
+    if lens_from:
+        argv += ["--lens-from", str(lens_from)]
     return argv
 
 
@@ -69,6 +74,8 @@ class App:
         self.v_acc = tk.StringVar(value="medium")
         self.v_tiles = tk.BooleanVar(value=False)
         self.v_height = tk.StringVar(value="")
+        self.v_seq = tk.BooleanVar(value=False)
+        self.v_lens = tk.StringVar(value="")
         self.v_status = tk.StringVar(value="Choose the folder with the photos.")
 
         f = ttk.Frame(root, padding=10)
@@ -82,6 +89,10 @@ class App:
         ttk.Label(f, text="Output folder").grid(row=r, column=0, sticky="w")
         ttk.Entry(f, textvariable=self.v_out).grid(row=r, column=1, sticky="ew", padx=6)
         ttk.Button(f, text="Browse...", command=self.pick_out).grid(row=r, column=2)
+        r += 1
+        ttk.Label(f, text="Lens from (optional)").grid(row=r, column=0, sticky="w")
+        ttk.Entry(f, textvariable=self.v_lens).grid(row=r, column=1, sticky="ew", padx=6)
+        ttk.Button(f, text="Browse...", command=self.pick_lens).grid(row=r, column=2)
         r += 1
         opts = ttk.Frame(f)
         opts.grid(row=r, column=0, columnspan=3, sticky="w", pady=(8, 4))
@@ -97,6 +108,10 @@ class App:
         ttk.Label(opts, text="Height (m)").pack(side="left", padx=(0, 4))
         ttk.Entry(opts, textvariable=self.v_height, width=6).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts, text="8192 px tiles + .vrt", variable=self.v_tiles).pack(side="left")
+        r += 1
+        ttk.Checkbutton(f, text="Photo series (sequence): file names in shooting order - match neighbours "
+                               "harder and bridge gaps between consecutive photos",
+                        variable=self.v_seq).grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
         bar = ttk.Frame(f)
         bar.grid(row=r, column=0, columnspan=3, sticky="ew", pady=4)
@@ -132,6 +147,12 @@ class App:
         if d:
             self.v_out.set(d)
 
+    def pick_lens(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Output folder of an earlier run (same camera and housing)")
+        if d:
+            self.v_lens.set(d)
+
     def start(self):
         from tkinter import messagebox
         inp = self.v_in.get().strip()
@@ -156,7 +177,8 @@ class App:
         out = self.v_out.get().strip() or str(Path(inp) / "mosaic2d")
         self.out_dir = Path(out)
         argv = build_argv(inp, out, res, self.v_prof.get(), self.v_acc.get(), self.v_tiles.get(),
-                          self.v_name.get().strip() or "mosaic", height)
+                          self.v_name.get().strip() or "mosaic", height, self.v_seq.get(),
+                          self.v_lens.get().strip() or None)
         self.log.delete("1.0", "end")
         self.q.put("mosaic2d " + " ".join(argv) + "\n\n")
         self.b_run.configure(state="disabled")

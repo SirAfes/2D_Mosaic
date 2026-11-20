@@ -2,6 +2,20 @@
 
 ## 0.3.0
 
+- `--sequence` (checkbox "Photo series" in the window): for photos taken as a series.
+  Direct neighbours in the shooting order are matched with every method and relaxed
+  thresholds (window of 6), and where two consecutive photos are still not connected by
+  any matched pair (featureless sand, blur, a turn) a weak link with the typical step
+  between consecutive photos joins them, so the series stays one mosaic in its order.
+  Only links that join separate groups are added; photos placed only this way are listed
+  and lose overlaps to matched photos. The camera adjustment now honours pair weights.
+- Image quality no longer drifts along single strips: the overlap comparison is split by
+  where the overlap lies in each photo, and one sharpness per photo is solved together
+  with an in-frame sharpness field (quadratic in the image position) shared by all
+  photos. A camera tilted forward sees its far edge through more water, so each photo
+  looked sharper than the one before it; along a 281-photo ledge transect the quality
+  went from 0.00 to 3000 and half the photos were wrongly called blurred.
+- `mosaic2d render --readjust` re-estimates the image quality from the ingest cache.
 - Faster output: the TIFF writer reads the mosaic one row of tiles at a time (one
   sequential pass instead of a scattered read per tile) and compresses tiles in parallel;
   same bytes as before. Writing the 91 000 x 28 600 px RGB dive mosaic had taken 5 hours.

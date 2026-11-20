@@ -88,8 +88,9 @@ def image_to_plane(P, f, c):
 
 
 class _Problem:
-    def __init__(self, rows_i, rows_j, p, q, cen_i, cen_j, center, radius):
+    def __init__(self, rows_i, rows_j, p, q, cen_i, cen_j, center, radius, wt=None):
         self.ri, self.rj = rows_i, rows_j
+        self.wt = np.ones(len(p)) if wt is None else wt      # per tie point (pair weight)
         self.p, self.q = p, q
         self.ci, self.cj = cen_i, cen_j
         self.center, self.radius = center, radius
@@ -177,10 +178,11 @@ def run_camera_bundle(nodes, corr, pair_H, sizes, focal_px, focal_sigma=0.3, dis
 
     # 2. tie points (thinned, both directions)
     def build(cs):
-        I, J, p, q = [], [], [], []
+        I, J, p, q, W = [], [], [], [], []
         for c in cs:
             pp, qq = BA._thin(c.p, c.q, max_corr_per_pair, sizes[c.i])
             for a_, b_, x_, y_ in ((c.i, c.j, pp, qq), (c.j, c.i, qq, pp)):
+                W.append(np.full(len(x_), float(c.weight)))
                 I.append(np.full(len(x_), rows[a_]))
                 J.append(np.full(len(x_), rows[b_]))
                 p.append(x_)
@@ -189,7 +191,7 @@ def run_camera_bundle(nodes, corr, pair_H, sizes, focal_px, focal_sigma=0.3, dis
         J = np.concatenate(J)
         cen = np.array([[sizes[n][0] / 2.0, sizes[n][1] / 2.0] for n in main])
         return _Problem(I, J, np.concatenate(p).astype(np.float64), np.concatenate(q).astype(np.float64),
-                        cen[I], cen[J], center, radius)
+                        cen[I], cen[J], center, radius, np.concatenate(W))
 
     cs = list(use)
     prob = build(cs)
@@ -316,7 +318,7 @@ def _lm(prob, P, g, F, a_row, anchor_fix, href, logf0, focal_sigma, height_sigma
     def total_cost(P, g):
         r = prob.residuals(P, P, g)
         c, _ = prior_terms(P, g)
-        return float(_robust_cost(r, robust_px).sum()) + c
+        return float((_robust_cost(r, robust_px) * prob.wt).sum()) + c
 
     cost = total_cost(P, g)
     lam = 1e-3
@@ -325,7 +327,7 @@ def _lm(prob, P, g, F, a_row, anchor_fix, href, logf0, focal_sigma, height_sigma
         its = it + 1
         r0 = prob.residuals(P, P, g)
         s = (r0 * r0).sum(1)
-        w = 1.0 / (1.0 + s / R2)                       # Cauchy IRLS weights
+        w = prob.wt / (1.0 + s / R2)                   # Cauchy IRLS weights x pair weight
         rows_l, cols_l, vals_l = [], [], []
         rid = np.arange(N)
         for k in range(NP):

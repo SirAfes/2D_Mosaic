@@ -64,6 +64,8 @@ class Settings:
     n_features: int = 8000
     preselection: str = "auto"       # auto | sequential | generic | exhaustive
     window: int = 3                  # sequential neighbours
+    sequence: bool = False           # photos in shooting order: neighbours matched harder, gaps bridged
+    lens_from: str | None = None     # report.json / project.pkl of an earlier run: reuse its lens calibration
     distortion: bool = True          # self-calibrate radial distortion k1, k2
     ref_band: str | None = None      # e.g. "560 nm"; None = automatic
     blend: str = "mosaic"            # mosaic | average | disabled
@@ -136,15 +138,20 @@ def image_sharpness(img: np.ndarray) -> float:
     return float(cv2.Laplacian(g, cv2.CV_32F).var())
 
 
-def _overlap_log_ratio(a: np.ndarray, b: np.ndarray, H: np.ndarray, s: float = 0.5):
-    """log(sharpness of a / sharpness of b) on their common area (H: a -> b).
-    ``s``: internal down-scaling of a and b (1.0 when they are already small)."""
-    def energy(img, mask):
-        g = cv2.GaussianBlur(img.astype(np.float32), (0, 0), 1.0)
-        lap = cv2.Laplacian(g, cv2.CV_32F)
-        m = cv2.erode(mask, np.ones((15, 15), np.uint8)) > 0   # > blur + Laplacian support
-        return float((lap[m] ** 2).mean()) if m.sum() > 2000 else None
+QCELLS = 3                       # overlap split into QCELLS x QCELLS cells per image
 
+
+def _overlap_log_ratio(a: np.ndarray, b: np.ndarray, H: np.ndarray, s: float = 0.5,
+                       cells: int = 0):
+    """log(sharpness of a / sharpness of b) on their common area (H: a -> b).
+    ``s``: internal down-scaling of a and b (1.0 when they are already small).
+
+    With ``cells`` > 0 the common area is split by where it lies in each image
+    (a cells x cells grid in both) and a list [(mean basis(a) - mean basis(b),
+    log ratio, weight)] is returned instead, the basis being a quadratic in the
+    image position (u, v, u^2, v^2, uv): sharpness varies inside a frame (a camera tilted
+    forward sees its far edge through more water), and consecutive frames overlap
+    with the far edge of one and the near edge of the next."""
     S = np.diag([s, s, 1.0])
     a, b = a.astype(np.float32), b.astype(np.float32)
     a2 = a if s == 1.0 else cv2.resize(a, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -156,11 +163,62 @@ def _overlap_log_ratio(a: np.ndarray, b: np.ndarray, H: np.ndarray, s: float = 0
     m_b = cv2.warpPerspective(ones_a, Hs, b2.shape[::-1], flags=cv2.INTER_NEAREST)
     b_in_a = cv2.warpPerspective(b2, np.linalg.inv(Hs), a2.shape[::-1], borderMode=cv2.BORDER_REPLICATE)
     m_a = cv2.warpPerspective(ones_b, np.linalg.inv(Hs), a2.shape[::-1], flags=cv2.INTER_NEAREST)
-    e = [energy(a_in_b, m_b), energy(b2, m_b), energy(a2, m_a), energy(b_in_a, m_a)]
-    if any(v is None or v <= 0 for v in e):
-        return None
-    # (warped a vs native b) and (native a vs warped b): interpolation bias cancels
-    return 0.5 * (np.log(e[0] / e[1]) + np.log(e[2] / e[3]))
+
+    def lap2(img):
+        g = cv2.GaussianBlur(img, (0, 0), 1.0)
+        return cv2.Laplacian(g, cv2.CV_32F) ** 2
+
+    k = np.ones((15, 15), np.uint8)                      # > blur + Laplacian support
+    mb = cv2.erode(m_b, k) > 0
+    ma = cv2.erode(m_a, k) > 0
+    if not cells:
+        if mb.sum() <= 2000 or ma.sum() <= 2000:
+            return None
+        e = [lap2(a_in_b)[mb].mean(), lap2(b2)[mb].mean(), lap2(a2)[ma].mean(), lap2(b_in_a)[ma].mean()]
+        if min(e) <= 0:
+            return None
+        # (warped a vs native b) and (native a vs warped b): interpolation bias cancels
+        return 0.5 * (np.log(e[0] / e[1]) + np.log(e[2] / e[3]))
+
+    def cell_of(x, y, shape):
+        h, w = shape
+        return (np.clip((y * cells / h).astype(int), 0, cells - 1) * cells
+                + np.clip((x * cells / w).astype(int), 0, cells - 1))
+
+    def basis(x, y, shape):
+        h, w = shape
+        u, v = 2 * x / w - 1, 2 * y / h - 1
+        return np.stack([u, v, u * u, v * v, u * v])
+
+    nk = cells ** 4
+
+    def grouped(mask, e_num, e_den, own_shape, other_shape, Hm, own_is_a):
+        ys, xs = np.nonzero(mask)
+        if len(xs) <= 2000:
+            return {}
+        p = cv2.perspectiveTransform(np.column_stack([xs, ys]).astype(np.float64)[None], Hm)[0]
+        c_own = cell_of(xs, ys, own_shape)
+        c_oth = cell_of(p[:, 0], p[:, 1], other_shape)
+        key = c_own * cells * cells + c_oth if own_is_a else c_oth * cells * cells + c_own
+        nn = np.bincount(key, minlength=nk).astype(np.float64)
+        en = np.bincount(key, e_num[ys, xs], minlength=nk)
+        ed = np.bincount(key, e_den[ys, xs], minlength=nk)
+        b_own = basis(xs.astype(np.float64), ys.astype(np.float64), own_shape)
+        b_oth = basis(p[:, 0], p[:, 1], other_shape)
+        b_a, b_b = (b_own, b_oth) if own_is_a else (b_oth, b_own)
+        diff = np.stack([np.bincount(key, b_a[t] - b_b[t], minlength=nk) for t in range(5)], 1)
+        return {kk: (en[kk], ed[kk], nn[kk], diff[kk] / nn[kk]) for kk in np.nonzero(nn > 800)[0]}
+
+    g1 = grouped(mb, lap2(a_in_b), lap2(b2), b2.shape, a2.shape, np.linalg.inv(Hs), False)
+    g2 = grouped(ma, lap2(a2), lap2(b_in_a), a2.shape, b2.shape, Hs, True)
+    out = []
+    for kk in set(g1) & set(g2):
+        (n1, d1, w1, f1), (n2, d2, w2, f2) = g1[kk], g2[kk]
+        if min(n1, d1, n2, d2) <= 0:
+            continue
+        r = 0.5 * (np.log(n1 / d1) + np.log(n2 / d2))
+        out.append((0.5 * (f1 + f2), float(r), float(np.sqrt(min(w1, w2)))))
+    return out or None
 
 
 def short_label(stem: str) -> str:
@@ -462,12 +520,19 @@ class Project:
 
         For every accepted pair the two working images are compared on their
         common area only, in both directions (each image warped onto the other,
-        so interpolation blur affects both sides equally). The log ratios are
-        then solved for one value per frame by least squares (median = 1).
+        so interpolation blur affects both sides equally), separately for each
+        combination of image cells (QCELLS x QCELLS grid) the common area falls in.
+        One sharpness per frame and one in-frame sharpness field shared by all
+        frames are solved together by robust least squares (median frame = 1).
+        Without the field, a camera tilted forward (far edge blurrier) made every
+        frame look sharper than the one before it, and along a 280-frame strip
+        the "quality" drifted from 0.00 to 3000.
         Frames without accepted pairs keep the plain per-image measure.
         """
         idx = {f.index: k for k, f in enumerate(self.frames)}
-        rows, rhs = [], []
+        n = len(self.frames)
+        nb = 5                                          # quadratic field: u, v, u^2, v^2, uv
+        rows, rhs, wts, fdiff = [], [], [], []
         for (i, j), r in self.pairs.items():
             if not r.ok or r.H is None or r.method == "phasecorr":
                 continue
@@ -475,30 +540,66 @@ class Project:
             a, b = getattr(fa, "qimg", None), getattr(fb, "qimg", None)
             if a is not None and b is not None:   # quality images: half the working resolution
                 Hh = np.diag([0.5, 0.5, 1.0]) @ r.H @ np.diag([2.0, 2.0, 1.0])
-                ra = _overlap_log_ratio(a, b, Hh, s=1.0)
+                res = _overlap_log_ratio(a, b, Hh, s=1.0, cells=QCELLS)
             elif fa.reg is not None and fb.reg is not None:   # projects from older versions
-                ra = _overlap_log_ratio(fa.reg, fb.reg, r.H)
+                res = _overlap_log_ratio(fa.reg, fb.reg, r.H, cells=QCELLS)
             else:
                 continue
-            if ra is None:
-                continue
-            rows.append((idx[i], idx[j]))
-            rhs.append(ra)
-        n = len(self.frames)
+            for fd, ra, w in res or ():
+                rows.append((idx[i], idx[j]))
+                fdiff.append(fd)
+                rhs.append(ra)
+                wts.append(w)
         x = np.log(np.array([max(f.sharpness, 1e-9) for f in self.frames]))
         x -= np.median(x)
+        coef = np.zeros(nb)
         if rows:
-            A = np.zeros((len(rows) + 1, n))
-            for k, (i, j) in enumerate(rows):
-                A[k, i], A[k, j] = 1.0, -1.0
-            A[-1, :] = 1e-3                      # gauge: tiny pull to zero mean
-            sol, *_ = np.linalg.lstsq(A, np.r_[rhs, 0.0], rcond=None)
+            import scipy.sparse as sp
+            from scipy.sparse.linalg import lsqr
+            m = len(rows)
+            R = np.array(rows)
+            Fd = np.asarray(fdiff)
+            rr = np.r_[np.repeat(np.arange(m), 2), np.repeat(np.arange(m), nb)]
+            cc = np.r_[R.ravel(), np.tile(n + np.arange(nb), m)]
+            vv = np.r_[np.tile([1.0, -1.0], m), Fd.ravel()]
+            # every frame weakly pulled to 1. On a single strip a steady trend from
+            # frame to frame and a difference between the leading and trailing edge
+            # explain the same ratios; the pull lets the field take it. A blurred
+            # frame contradicts its neighbours in dozens of cells and stays low.
+            gr = m + np.arange(n)
+            A = sp.csr_matrix((np.r_[vv, np.ones(n)], (np.r_[rr, gr], np.r_[cc, np.arange(n)])),
+                              shape=(m + n, n + nb))
+            y = np.r_[rhs, np.zeros(n)]
+            w0 = np.asarray(wts) / np.median(wts)
+            prior_w = np.full(n, 0.3)
+            w = np.r_[w0, prior_w]
+            for _ in range(5):                          # Cauchy IRLS: occlusions, moving objects
+                sol = lsqr(sp.diags(w) @ A, w * y, atol=1e-10, btol=1e-10)[0]
+                res_ = (A @ sol - y)[:m]
+                sc = 1.4826 * np.median(np.abs(res_)) + 1e-3
+                w = np.r_[w0 / np.sqrt(1 + (res_ / (2 * sc)) ** 2), prior_w]
             connected = np.zeros(n, bool)
-            for i, j in rows:
-                connected[i] = connected[j] = True
-            x = np.where(connected, sol - np.median(sol[connected]), x)
+            connected[R[:, 0]] = connected[R[:, 1]] = True
+            q = sol[:n]
+            x = np.where(connected, q - np.median(q[connected]), x)
+            coef = sol[n:]
+        gy, gx = np.mgrid[-1:1.01:0.5, -1:1.01:0.5]
+        field = np.einsum("k,kij->ij", coef, np.stack([gx, gy, gx * gx, gy * gy, gx * gy]))
+        self.sharpness_field = np.exp(field - np.median(field))          # 5 x 5 samples
         for f, v in zip(self.frames, x):
             f.quality = float(np.exp(v))
+        if np.ptp(field) > np.log(1.5):
+            self.log(f"  sharpness inside the frame varies {np.exp(np.ptp(field)):.1f}x "
+                     f"across the frame (accounted for)")
+        # photos placed only from the shooting order: any matched photo is better there
+        real = set()
+        for (i, j), r in self.pairs.items():
+            if r.ok:
+                real |= {i, j}
+        for i, j in getattr(self, "sequence_links", []):
+            for k in (i, j):
+                if k not in real:
+                    self.frames[k].quality = min(self.frames[k].quality, 0.3)
         low = [f.path.name for f in self.frames if f.quality < 0.5]
         if low:
             self.log(f"  {len(low)} blurred frame(s) (sharpness < 0.5 x median, from overlaps): "
@@ -572,9 +673,11 @@ class Project:
         n = len(self.frames)
         mode = self.s.preselection
         cand = set()
-        if mode in ("auto", "sequential"):
+        seq = getattr(self.s, "sequence", False)
+        if mode in ("auto", "sequential") or seq:
+            window = max(self.s.window, 6) if seq else self.s.window
             for i in range(n):
-                for d in range(1, self.s.window + 1):
+                for d in range(1, window + 1):
                     if i + d < n:
                         cand.add((i, i + d))
         if mode == "exhaustive":
@@ -592,6 +695,12 @@ class Project:
         methods = methods or self.methods
         strategy = strategy or self.s.strategy
         p = self.s.match_params()
+        seq = getattr(self.s, "sequence", False)
+        # sequence: direct neighbours in the shooting order are known to overlap, so
+        # fewer matches are enough and every method is tried before giving up
+        import dataclasses
+        p_seq = dataclasses.replace(p, min_inliers=max(10, p.min_inliers // 2), min_inlier_ratio=0.05,
+                                    min_coverage=0.005)
         t = time.time()
         if strategy == "single":
             methods = methods[:1]
@@ -609,17 +718,21 @@ class Project:
                 tried = list(methods)
             else:
                 limit = self.s.cascade_limit if strategy == "cascade" else 1
+                near = seq and j - i <= 2
+                if near and strategy == "cascade":
+                    limit = len(methods)
                 # far pairs that the thumbnail check found no overlap for: primary method only
-                far = (not trusted and (j - i > 1) and bool(self.generic_scores)
+                far = (not trusted and not near and (j - i > 1) and bool(self.generic_scores)
                        and (ij not in self.generic_scores))
                 for m in methods[: (1 if far else limit)]:
-                    r = MT.match_pair(self.features(m, i), self.features(m, j), i, j, p)
+                    r = MT.match_pair(self.features(m, i), self.features(m, j), i, j, p_seq if near else p)
                     tried.append(m)
                     if res is None or r.n_inliers > res.n_inliers or r.ok:
                         res = r
                     if r.ok:
                         break
-            if (not res.ok and self.s.phasecorr and j - i == 1 and strategy != "single"):
+            if (not res.ok and self.s.phasecorr and (j - i == 1 or (seq and j - i == 2))
+                    and strategy != "single"):
                 r = MT.phase_correlation_pair(self.frames[i].reg, self.frames[j].reg, i, j)
                 tried.append("phasecorr")
                 if r.ok:
@@ -649,7 +762,64 @@ class Project:
             w = 0.3 if r.method == "phasecorr" else 1.0
             corr.append(BA.Correspondences(i, j, p, q, w, r.method))
             pairH[(i, j)] = Hn
+        self.sequence_links = []
+        if getattr(self.s, "sequence", False):
+            corr, pairH = self._sequence_links(corr, pairH, sizes)
         return corr, pairH, sizes
+
+    def _sequence_links(self, corr, pairH, sizes):
+        """
+        Sequence mode: where neighbours in the shooting order are not connected by
+        any matched pair (featureless sand, blur, a turn), add a weak link that
+        assumes the typical step between consecutive photos (median shift of the
+        matched neighbours, no rotation or scale change). Only links that join two
+        separate groups are added, so matched geometry is not touched; photos placed
+        this way are listed in the log and lose overlaps to matched photos.
+        """
+        n = len(self.frames)
+        steps = []
+        for (i, j), H in pairH.items():
+            if j == i + 1:
+                w, h = sizes[i]
+                c = np.array([[[w / 2.0, h / 2.0]]])
+                steps.append(cv2.perspectiveTransform(c, H)[0, 0] - c[0, 0])
+        if not steps:
+            return corr, pairH
+        step = np.median(np.array(steps), axis=0)
+        parent = list(range(n))
+
+        def root(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        for c in corr:
+            parent[root(c.i)] = root(c.j)
+        corr, pairH = list(corr), dict(pairH)
+        for i in range(n - 1):
+            j = i + 1
+            if root(i) == root(j):
+                continue
+            w, h = sizes[i]
+            g = np.array([[x, y] for x in np.linspace(0.1, 0.9, 5) * w for y in np.linspace(0.1, 0.9, 4) * h])
+            q = g + step
+            wj, hj = sizes[j]
+            ok = (q[:, 0] > 0) & (q[:, 0] < wj) & (q[:, 1] > 0) & (q[:, 1] < hj)
+            if ok.sum() < 6:                        # typical step leaves no overlap: assume half a frame
+                q = g + step * (0.5 * min(w, h) / max(1e-6, float(np.hypot(*step))))
+                ok = (q[:, 0] > 0) & (q[:, 0] < wj) & (q[:, 1] > 0) & (q[:, 1] < hj)
+            corr.append(BA.Correspondences(i, j, g[ok], q[ok], 0.05, "sequence"))
+            T = np.array([[1, 0, step[0]], [0, 1, step[1]], [0, 0, 1]], np.float64)
+            pairH[(i, j)] = T
+            parent[root(i)] = root(j)
+            self.sequence_links.append((i, j))
+        if self.sequence_links:
+            names = ", ".join(f"{self.frames[i].path.stem}-{self.frames[j].path.stem}"
+                              for i, j in self.sequence_links[:10])
+            more = " ..." if len(self.sequence_links) > 10 else ""
+            self.log(f"  sequence: {len(self.sequence_links)} gap(s) between consecutive photos bridged "
+                     f"by the typical step ({step[0]:+.0f}, {step[1]:+.0f}) px: {names}{more}")
+        return corr, pairH
 
     def adjust(self):
         t = time.time()
@@ -682,6 +852,9 @@ class Project:
         beside it - and the main block is adjusted once more on its own.
         result.components = [main] + the other groups (for render_blocks).
         """
+        if lens is None and model == "camera":
+            lens = self.fixed_lens()
+
         def solve(nds, mdl):
             cs = set(nds)
             c_sub = [c for c in corr if c.i in cs and c.j in cs]
@@ -821,6 +994,38 @@ class Project:
             return float(hm) / f
         return None
 
+    def fixed_lens(self):
+        """Lens calibration (focal length, k1, k2) from an earlier run (--lens-from), or None."""
+        src = getattr(self.s, "lens_from", None)
+        if not src:
+            return None
+        if getattr(self, "_fixed_lens", None) is not None:
+            return self._fixed_lens
+        src = Path(src)
+        if src.is_dir():
+            cand = sorted(src.glob("*_report.json"))
+            if not cand:
+                raise FileNotFoundError(f"--lens-from: no *_report.json in {src}")
+            src = cand[0]
+        if src.suffix.lower() == ".json":
+            d = json.loads(src.read_text(encoding="utf-8"))
+            cam = d.get("camera") or {}
+            f, k = cam.get("focal_px"), d.get("distortion_k1_k2")
+            w0 = max(d["lens_reference_size"]) if d.get("lens_reference_size") else None
+        else:
+            other = Project.load(src, out_dir=self.out)
+            cam = (other.result.camera or {}) if other.result is not None else {}
+            f, k = cam.get("focal_px"), list(other.result.k)
+            w0 = max(other.frames[0].ref_size)
+        if not f or k is None:
+            raise ValueError(f"--lens-from: {src} has no camera-model lens (focal length, k1, k2)")
+        w, h = self.frames[0].ref_size
+        if w0 and abs(max(w, h) / w0 - 1) > 0.01:     # same camera, other working size
+            f = f * max(w, h) / w0
+        self._fixed_lens = {"focal_px": float(f), "k": np.asarray(k, np.float64)}
+        self.log(f"  lens from {src.name}: f = {f:.0f} px, k1 = {k[0]:+.4f}, k2 = {k[1]:+.4f} (kept fixed)")
+        return self._fixed_lens
+
     def nominal_focal(self):
         """(focal length in native px of the reference image, prior width, source)."""
         if self.s.focal_px:
@@ -920,6 +1125,42 @@ class Project:
                 if self.match(extra):          # nothing new: the adjustment would be the same
                     self.adjust()
 
+    def refresh_quality(self):
+        """Estimate the frame sharpness again (after an update of mosaic2d) from the
+        quality images in the ingest cache; frames not in the cache keep their value."""
+        import pickle
+        dirs = [self._cache_dir()]
+        if getattr(self, "_project_dir", None) is not None:
+            dirs.append(Path(self._project_dir) / "_cache")
+        hits = 0
+        for k, fr in enumerate(self.frames):
+            c = None
+            try:
+                key = self._cache_key(self.files[k])
+            except OSError:                        # photo moved or deleted
+                key = None
+            for d_ in dirs if key else ():
+                f = d_ / f"{key}.pkl"
+                if f.is_file():
+                    try:
+                        with open(f, "rb") as fh:
+                            c = pickle.load(fh)
+                        break
+                    except Exception:
+                        c = None
+            if c is not None and getattr(c, "qimg", None) is not None:
+                fr.qimg = c.qimg
+                hits += 1
+        if hits < max(2, len(self.frames) // 2):
+            self.log(f"  sharpness not re-estimated: only {hits}/{len(self.frames)} frames in the cache")
+            for fr in self.frames:
+                fr.qimg = None
+            return
+        self.log(f"  sharpness re-estimated from the cache ({hits}/{len(self.frames)} frames)")
+        self._image_quality()
+        for fr in self.frames:
+            fr.qimg = None
+
     # ------------------------------------------------------------------ project file
     def save(self, path):
         """Save the aligned project (no features, no log handle) for later rendering."""
@@ -951,6 +1192,7 @@ class Project:
             d = _Unpickler(fh).load()
         proj = cls.__new__(cls)
         proj.__dict__.update(d["state"])
+        proj._project_dir = Path(path).resolve().parent
         from dataclasses import fields as _fields
         for f in _fields(Settings):            # projects saved by older versions
             if not hasattr(proj.s, f.name):
@@ -1212,12 +1454,15 @@ class Project:
             "reprojection_rmse_px": r.rmse_px if r else None,
             "reprojection_median_px": r.median_px if r else None,
             "distortion_k1_k2": r.k.tolist() if r else None,
+            "lens_reference_size": list(self.frames[0].ref_size) if self.frames else None,
             "anchor": self.frames[r.anchor].path.name if r else None,
             "canvas_px": getattr(self, "canvas_size", None),
             "flat_field_corner_over_centre": getattr(self, "flat_stats", {}),
             "seams": self.s.seams,
             "seam_area_moved_by_graphcut": getattr(self, "seam_changed", None),
             "image_quality": {f.path.name: round(f.quality, 3) for f in self.frames},
+            "sequence_links": [[self.frames[i].path.name, self.frames[j].path.name]
+                               for i, j in getattr(self, "sequence_links", [])],
             "timing_s": {k: round(v, 1) for k, v in self.timing.items()},
         }
         cam = getattr(r, "camera", None) if r else None
