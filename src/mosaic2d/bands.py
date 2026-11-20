@@ -185,25 +185,40 @@ def consensus_check(results: list[FrameLensAlignment], tol_px: float = 12.0,
     return med, bad
 
 
-def band_saturation(img: np.ndarray) -> tuple[float, float]:
-    """(fraction of clipped pixels, fraction of near-black pixels) of one band,
-    zero pixels (no data, e.g. borders left by band alignment) not counted."""
+def band_saturation(img: np.ndarray, valid: np.ndarray | None = None) -> tuple[float, float]:
+    """(fraction of clipped pixels, fraction of black pixels) of one band over the
+    image area ``valid`` (default: its non-zero pixels; pass the pixels where any
+    band has data, so that a band that is empty everywhere counts as black)."""
     v = img.reshape(-1)
-    v = v[:: max(1, v.size // 500000)]
-    v = v[v > 0]
+    m = (v > 0) if valid is None else valid.reshape(-1)
+    step = max(1, v.size // 500000)
+    v, m = v[::step], m[::step]
+    v = v[m]
     if v.size == 0:
         return 0.0, 1.0
     if np.issubdtype(img.dtype, np.integer):
         top = float(np.iinfo(img.dtype).max)
-        vmax = float(v.max())
-        if vmax < top:                  # 10/12/14-bit data in 16-bit words: its own ceiling
-            bits = int(np.ceil(np.log2(vmax + 1)))
+        if top > 255:                   # 10/12/14-bit data in 16-bit words: its own ceiling
+            vmax = float(v.max())
+            bits = max(10, int(np.ceil(np.log2(vmax + 1))))
             top = min(top, float(2 ** bits - 1))
     else:
-        top = float(v.max())
+        top = float(v.max()) or 1.0
     sat = float((v >= 0.98 * top).mean())
-    dark = float((v <= 0.01 * top).mean())
+    dark = float((v <= 0.02 * top).mean())
     return sat, dark
+
+
+def _static(r, size, frac=0.005) -> bool:
+    """True if a matched pair maps the frame onto itself: features that stay at the
+    same image position (sensor pattern, dust, a housing part, a band that is all
+    black or clipped) rather than scene content."""
+    if not r.ok or r.H is None:
+        return False
+    w, h = size
+    c = np.array([[[0, 0], [w, 0], [w, h], [0, h], [w / 2, h / 2]]], np.float64)
+    d = np.abs(cv2.perspectiveTransform(c, r.H) - c).max()
+    return d < frac * np.hypot(w, h)
 
 
 def choose_reference_band(frames_data: list, prof: CameraProfile, method,
@@ -221,21 +236,36 @@ def choose_reference_band(frames_data: list, prof: CameraProfile, method,
     """
     groups = groups or [list(range(len(frames_data)))]
     scores, info = {}, {}
+    # image area with data: any band non-zero (borders left by band alignment are 0 everywhere)
+    valid = []
+    for fd in frames_data:
+        m = None
+        for b in prof.bands:
+            nz = band_image(fd, b) > 0
+            m = nz if m is None else (m | nz)
+        valid.append(m)
+    n_static = {}
     for b in prof.bands:
         raw = [band_image(fd, b) for fd in frames_data]
-        sd = np.array([band_saturation(r) for r in raw])
+        sd = np.array([band_saturation(r, v) for r, v in zip(raw, valid)])
         sat, dark = float(np.median(sd[:, 0])), float(np.median(sd[:, 1]))
-        feats = []
+        feats, sizes = [], []
         for r in raw:
             g = r.astype(np.float32)
             if work_scale != 1.0:
                 g = cv2.resize(g, None, fx=work_scale, fy=work_scale, interpolation=cv2.INTER_AREA)
             feats.append(method(normalise_for_features(g)))
-        inl = []
+            sizes.append((g.shape[1], g.shape[0]))
+        inl, stat = [], 0
         for run in groups:
             for k in range(len(run) - 1):
                 rr = match_fn(feats[run[k]], feats[run[k + 1]])
+                if _static(rr, sizes[run[k]]):      # pattern fixed in the image, not the scene
+                    stat += 1
+                    inl.append(0.0)
+                    continue
                 inl.append(rr.n_inliers * min(1.0, rr.coverage / 0.2) if rr.ok else 0.0)
+        n_static[b.name] = stat
         m = float(np.median(inl)) if inl else 0.0
         penalty = max(0.0, 1.0 - 10.0 * sat) * max(0.0, 1.0 - dark)
         scores[b.name] = round(m * penalty, 1)
@@ -248,8 +278,13 @@ def choose_reference_band(frames_data: list, prof: CameraProfile, method,
         "minus clipped/black pixels):")
     for name, v in sorted(scores.items(), key=lambda kv: -kv[1]):
         m, sat, dark = info[name]
+        note = "   (matches at the same image position: fixed pattern)" if n_static[name] else ""
         log(f"    {name:>10s}: {v:7.0f}   matches {m:6.0f}   saturated {sat * 100:5.2f} %   "
-            f"black {dark * 100:5.1f} %")
+            f"black {dark * 100:5.1f} %{note}")
+    unusable = [n for n, (m, sat, dark) in info.items() if sat > 0.5 or dark > 0.5]
+    if unusable:
+        log(f"  WARNING: band(s) {', '.join(unusable)} are mostly black or clipped in the input photos "
+            f"(check the export / bit depth); they will be empty or flat in the mosaic too")
     if scores[best.name] <= 0:
         # nothing matched (e.g. a sample of blank photos): green-most band with least clipping
         best = min(prof.bands, key=lambda b: (info[b.name][1] > 0.01, abs((b.wavelength_nm or 550) - 550)))

@@ -750,6 +750,14 @@ class Project:
                 if r.ok:
                     res = r
             res.tried = tried
+            if res.ok and res.method != "phasecorr" and self.frames[i].reg is not None:
+                h_, w_ = self.frames[i].reg.shape[:2]
+                if BD._static(res, (w_, h_), 0.002):
+                    # every match at the same image position: a pattern fixed to the camera
+                    # (sensor noise, dust, a housing part, an empty or clipped band), or the
+                    # same photo twice - not a measurement of the camera's movement
+                    res.ok = False
+                    res.reason = "matches at the same image position (fixed pattern or duplicate photo)"
             return ij, res
         with ThreadPoolExecutor(self.jobs) as ex:
             for ij, r in ex.map(one, pairs):
@@ -757,6 +765,11 @@ class Project:
         self.timing["matching_s"] = self.timing.get("matching_s", 0) + time.time() - t
         ok = sum(1 for ij in pairs if self.pairs[ij].ok)
         self.log(f"  matched {len(pairs)} pairs: {ok} accepted")
+        stat = sum(1 for ij in pairs if "same image position" in (getattr(self.pairs[ij], "reason", "") or ""))
+        if stat:
+            self.log(f"  {stat} pair(s) rejected: all matches at the same image position (a pattern "
+                     f"fixed to the camera or duplicate photos)"
+                     + (" - most pairs: check the reference band" if stat > ok else ""))
         return ok
 
     # ---------------------------------------------------------------- adjustment

@@ -8,6 +8,12 @@
   nearly black pixels; the log lists matches, saturation and black share per band. If
   no band matches, the band nearest 550 nm with the least clipping is used. Faster (ranking at 1400 px). "Ref. band" field in the window to
   set it by hand (e.g. 560 nm).
+- Matches that stay at the same image position (a pattern fixed to the camera: sensor
+  noise, dust, a housing part, or a band that is black or clipped) no longer count:
+  such pairs are rejected and do not score in the reference band choice. On an 8-bit
+  Agrowing export whose 405 nm band was black, 405 nm had been chosen and every photo
+  was "matched" onto itself (adjustment error 0.00 px, photos stacked). The log warns
+  about bands that are mostly black or clipped in the input.
 - Viewer for large and multispectral mosaics: `mosaic2d view file.tif`, or "View a
   mosaic..." in the window. Reads only the tiles on screen from the overview level that
   fits the zoom; any three bands (or one) with a percentile stretch, presets for natural

@@ -29,6 +29,7 @@ def test_band_saturation():
 def test_textured_unclipped_band_wins():
     world = _world()
     rng = np.random.default_rng(1)
+    pattern = (rng.random((600, 800)) * 3000 + 500).astype(np.uint16)  # sensor pattern, same in every photo
     frames = []
     for k in range(4):
         x0 = 100 + 150 * k
@@ -36,9 +37,9 @@ def test_textured_unclipped_band_wins():
         good = (v * 3000 + 500).astype(np.uint16)                       # textured, 12-bit
         clipped = np.minimum(v * 9000 + 500, 4095).astype(np.uint16)    # same texture, 40 % clipped
         noise = (rng.random(v.shape) * 3000 + 500).astype(np.uint16)    # no stable texture
-        frames.append(FrameData({1: np.dstack([noise, clipped, good])}, {}, v.shape))
+        frames.append(FrameData({1: np.dstack([noise, clipped, good, pattern])}, {}, v.shape))
     prof = CameraProfile("t", bands=[Band("405 nm", 1, 0, 405.0), Band("530 nm", 1, 1, 530.0),
-                                     Band("560 nm", 1, 2, 560.0)])
+                                     Band("560 nm", 1, 2, 560.0), Band("850 nm", 1, 3, 850.0)])
     reg = FT.build_registry(3000)
     p = MT.MatchParams(guided=False)
     best, scores = choose_reference_band(frames, prof, reg["sift"].build,
@@ -46,3 +47,4 @@ def test_textured_unclipped_band_wins():
                                          log=lambda *a: None)
     assert best.name == "560 nm", scores
     assert scores["405 nm"] == 0 and scores["530 nm"] < 0.5 * scores["560 nm"], scores
+    assert scores["850 nm"] == 0, scores          # matches only on the fixed pattern
