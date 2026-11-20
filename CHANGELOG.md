@@ -2,6 +2,15 @@
 
 ## 0.3.0
 
+- Viewer for large and multispectral mosaics: `mosaic2d view file.tif`, or "View a
+  mosaic..." in the window. Reads only the tiles on screen from the overview level that
+  fits the zoom; any three bands (or one) with a percentile stretch, presets for natural
+  colour and NIR false colour, "stretch to view", band values of the clicked pixel, save
+  the view as PNG. Works with any TIFF layout (tiled or strips, interleaved or planar,
+  uncompressed read directly from disk); files without overviews (older mosaic2d output)
+  get a small one built once when opened. LZW / JPEG TIFFs (Metashape) need the
+  `imagecodecs` package, which the Windows executable includes (`pip install
+  mosaic2d[view]` otherwise).
 - `--sequence` (checkbox "Photo series" in the window): for photos taken as a series.
   Direct neighbours in the shooting order are matched with every method and relaxed
   thresholds (window of 6), and where two consecutive photos are still not connected by

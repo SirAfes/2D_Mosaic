@@ -29,7 +29,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[dev]" "pyinstaller>=6.11" "pyinstaller-hooks-contrib>=2024.10"
+          python -m pip install ".[dev,view]" "pyinstaller>=6.11" "pyinstaller-hooks-contrib>=2024.10"
 
       - name: Tests
         run: python -m pytest -q
@@ -40,6 +40,7 @@ jobs:
           --paths src
           --collect-submodules mosaic2d
           --collect-submodules numpy
+          --collect-submodules imagecodecs
           --hidden-import tkinter
           packaging/mosaic2d_exe.py
 
@@ -59,6 +60,7 @@ jobs:
           python packaging/make_smoke_data.py smoke\src
           & $exe run smoke\src -o smoke\out --resolution 0.5 --no-cache; if ($LASTEXITCODE) { exit 1 }
           if (-not (Test-Path smoke\out\mosaic.tif)) { Write-Error "no mosaic written"; exit 1 }
+          & $exe view smoke\out\mosaic.tif --selftest; if ($LASTEXITCODE) { exit 1 }
 
       - name: Zip
         shell: pwsh

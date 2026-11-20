@@ -17,6 +17,8 @@ keywords = ["mosaic", "image stitching", "orthomosaic", "multispectral", "underw
 
 [project.optional-dependencies]
 raw = ["rawpy>=0.24"]
+# the viewer reads LZW / JPEG compressed TIFFs (Metashape, GDAL) only with imagecodecs
+view = ["imagecodecs>=2024.1"]
 dev = ["pytest>=8"]
 
 [project.scripts]

@@ -119,6 +119,7 @@ class App:
         self.b_run.pack(side="left")
         self.b_open = ttk.Button(bar, text="Open output folder", command=self.open_out, state="disabled")
         self.b_open.pack(side="left", padx=6)
+        ttk.Button(bar, text="View a mosaic...", command=self.view).pack(side="left", padx=6)
         self.pb = ttk.Progressbar(bar, mode="indeterminate", length=160)
         self.pb.pack(side="left", padx=6)
         ttk.Label(bar, textvariable=self.v_status).pack(side="left", padx=6)
@@ -228,6 +229,20 @@ class App:
             self.v_status.set(f"Error: {info}")
         if self.out_dir and self.out_dir.exists():
             self.b_open.configure(state="normal")
+
+    def view(self):
+        """Viewer for any (multiband) TIFF; starts in the output folder if there is one."""
+        from tkinter import filedialog, messagebox
+        start = self.out_dir if self.out_dir and self.out_dir.exists() else (self.v_out.get() or None)
+        fn = filedialog.askopenfilename(title="Mosaic to view", initialdir=start or None,
+                                        filetypes=[("TIFF", "*.tif *.tiff"), ("all files", "*.*")])
+        if not fn:
+            return
+        from .viewer import ViewerWindow
+        try:
+            ViewerWindow(self.root, fn)
+        except Exception as e:                        # noqa: BLE001
+            messagebox.showerror("mosaic2d viewer", f"Cannot open {Path(fn).name}:\n{e}")
 
     def open_out(self):
         if not self.out_dir:

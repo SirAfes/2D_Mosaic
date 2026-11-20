@@ -128,6 +128,9 @@ def build_parser():
     sub.add_parser("methods", help="list feature methods")
     g = sub.add_parser("gui", help="open a window for choosing folders and options")
     g.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    v = sub.add_parser("view", help="view a mosaic (any TIFF, multispectral included): pick bands, zoom, pan")
+    v.add_argument("file", nargs="?", default=None)
+    v.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     return ap
 
 
@@ -140,6 +143,9 @@ def main(argv=None):
     if args.cmd == "gui":
         from .gui import main as gui_main
         return gui_main(selftest=args.selftest)
+    if args.cmd == "view":
+        from .viewer import main as view_main
+        return view_main(args.file, selftest=args.selftest)
     if args.cmd == "methods":
         reg = FT.build_registry()
         for m in reg.values():
